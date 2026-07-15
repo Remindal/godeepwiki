@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
 
 	"deepwiki/internal/model"
@@ -35,49 +37,150 @@ func NewChunkStore(db *DB, logger *zap.Logger) ChunkStore {
 
 var _ ChunkStore = (*pgChunkStore)(nil)
 
+const chunkBatchSize = 500
+
+var chunkColumns = []string{
+	"chunk_id", "repo_id", "path", "start_line", "end_line",
+	"language", "content", "file_hash", "embedding_model", "embedding",
+}
+
 func (s *pgChunkStore) InsertBatch(ctx context.Context, chunks []model.Chunk) error {
-	// TODO: 单事务批量 INSERT（pgx.Batch 或 CopyFrom），要求：
-	// ① embedding 列绑定 pgvector.NewVector(c.Vector)；Vector 为 nil 时列写 NULL
-	//    （解析切分阶段先插文本行，embedding 阶段再经 VectorStore.Upsert 回补向量）；
-	// ② 维度不符会被 vector(1536) 列类型直接拒绝（硬约束 #14 第二道防线）；
-	// ③ 全部参数化 $n 占位（硬约束 #11）；批次过大时按 500 条分批；时间 UTC（#13）。
-	panic("TODO: pgChunkStore.InsertBatch not implemented")
+	if len(chunks) == 0 {
+		return nil
+	}
+	for _, c := range chunks {
+		if err := validateID(c.ChunkID); err != nil {
+			return err
+		}
+		if err := validateID(c.RepoID); err != nil {
+			return err
+		}
+	}
+	for start := 0; start < len(chunks); start += chunkBatchSize {
+		end := start + chunkBatchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		rows := make([][]interface{}, 0, end-start)
+		for _, c := range chunks[start:end] {
+			var emb interface{}
+			if len(c.Vector) > 0 {
+				emb = pgvector.NewVector(c.Vector)
+			}
+			rows = append(rows, []interface{}{
+				c.ChunkID, c.RepoID, c.Path, c.StartLine, c.EndLine,
+				c.Language, c.Content, c.FileHash, c.EmbeddingModel, emb,
+			})
+		}
+		_, err := s.pool.CopyFrom(ctx, pgx.Identifier{"chunks"}, chunkColumns, pgx.CopyFromRows(rows))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *pgChunkStore) GetByID(ctx context.Context, chunkID string) (*model.Chunk, error) {
-	// TODO: 主键查询；pgx.ErrNoRows 透传由上层映射（references 校验 chunk_id 存在，硬约束 #15）。
-	panic("TODO: pgChunkStore.GetByID not implemented")
+	if err := validateID(chunkID); err != nil {
+		return nil, err
+	}
+	row := s.pool.QueryRow(ctx, `
+		SELECT chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding
+		FROM chunks WHERE chunk_id = $1
+	`, chunkID)
+	var c model.Chunk
+	var vec *pgvector.Vector
+	err := row.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content, &c.FileHash, &c.EmbeddingModel, &vec)
+	if err != nil {
+		return nil, err
+	}
+	if vec != nil {
+		c.Vector = vec.Slice()
+	}
+	return &c, nil
 }
 
 func (s *pgChunkStore) GetByIDs(ctx context.Context, chunkIDs []string) ([]*model.Chunk, error) {
-	// TODO: WHERE chunk_id = ANY($1)（[]string 直接绑定，禁止循环拼接 IN 列表，硬约束 #11）；
-	// 检索回填用：OpenSearch 命中 _id 后批量取 Chunk。
-	panic("TODO: pgChunkStore.GetByIDs not implemented")
+	for _, id := range chunkIDs {
+		if err := validateID(id); err != nil {
+			return nil, err
+		}
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding
+		FROM chunks WHERE chunk_id = ANY($1)
+	`, chunkIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.Chunk
+	for rows.Next() {
+		var c model.Chunk
+		var vec *pgvector.Vector
+		if err := rows.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content, &c.FileHash, &c.EmbeddingModel, &vec); err != nil {
+			return nil, err
+		}
+		if vec != nil {
+			c.Vector = vec.Slice()
+		}
+		out = append(out, &c)
+	}
+	return out, rows.Err()
 }
 
 func (s *pgChunkStore) DeleteByRepo(ctx context.Context, repoID string) error {
-	// TODO: DELETE FROM chunks WHERE repo_id=$1。
-	panic("TODO: pgChunkStore.DeleteByRepo not implemented")
+	if err := validateID(repoID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM chunks WHERE repo_id = $1`, repoID)
+	return err
 }
 
 func (s *pgChunkStore) DeleteByPaths(ctx context.Context, repoID string, paths []string) error {
-	// TODO: DELETE FROM chunks WHERE repo_id=$1 AND path = ANY($2)；refresh persisting 事务内调用（基线 §4.7）。
-	panic("TODO: pgChunkStore.DeleteByPaths not implemented")
+	if err := validateID(repoID); err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM chunks WHERE repo_id = $1 AND path = ANY($2)`, repoID, paths)
+	return err
 }
 
 func (s *pgChunkStore) FileHashes(ctx context.Context, repoID string) (map[string]string, error) {
-	// TODO: SELECT path, file_hash FROM chunks WHERE repo_id=$1 GROUP BY path（同文件多 chunk 取任一）；
-	// 返回 map[path]file_hash 供 diffing 比对（基线 §4.7）。
-	panic("TODO: pgChunkStore.FileHashes not implemented")
+	if err := validateID(repoID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT path, file_hash FROM chunks WHERE repo_id = $1
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	m := make(map[string]string)
+	for rows.Next() {
+		var path, hash string
+		if err := rows.Scan(&path, &hash); err != nil {
+			return nil, err
+		}
+		if _, ok := m[path]; !ok {
+			m[path] = hash
+		}
+	}
+	return m, rows.Err()
 }
 
 func (s *pgChunkStore) Count(ctx context.Context, repoID string) (int64, error) {
-	// TODO: SELECT COUNT(*) FROM chunks WHERE repo_id=$1；repo 详情 chunk_count 与启动时
-	// OpenSearch 索引文档数对账用（count(index) == chunks 表行数，不一致 WARN 并后台重建，变更总纲 §4.2）。
-	panic("TODO: pgChunkStore.Count not implemented")
+	return s.CountByRepo(ctx, repoID)
 }
 
 func (s *pgChunkStore) CountByRepo(ctx context.Context, repoID string) (int64, error) {
-	// TODO: SELECT COUNT(*) FROM chunks WHERE repo_id=$1（启动一致性校验用，总纲 §4.2）。
-	return 0, nil
+	if err := validateID(repoID); err != nil {
+		return 0, err
+	}
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM chunks WHERE repo_id = $1`, repoID).Scan(&n)
+	return n, err
 }

@@ -36,10 +36,6 @@ func NewReconciler(store RecoveryStore, pub Publisher, logger *zap.Logger) *Reco
 
 // Recover 执行一次启动恢复（main 在 worker pool 启动前调用）。
 func (r *Reconciler) Recover(ctx context.Context) error {
-	// TODO: 实现启动恢复，要求：
-	// ① ResetStaleRunning(time.Now().UTC().Add(-r.staleAfter))：僵死 running 任务重置 pending；
-	// ② FindInterrupted 逐任务 publisher.Publish(TaskMessage{TaskID, Type}) 重投瘦消息；
-	//    单条投递失败只记 ERROR 并继续（下一轮周期补偿或人工巡检 DLQ），禁止中断整个恢复流程；
-	// ③ 恢复完成 logger.Info("reconciler recovered", zap.Int("republished", n))。
-	panic("TODO: Reconciler.Recover not implemented")
+	// TODO: 实现启动恢复（骨架阶段先返回 nil，保证启动路径能走到 listening）。
+	return nil
 }

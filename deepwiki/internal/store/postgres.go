@@ -4,12 +4,24 @@ package store
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
+
+// idRegex 校验统一 ID：前缀 + 26 位 Crockford Base32 ULID（硬约束 #11）。
+var idRegex = regexp.MustCompile(`^(tsk_|repo_|chk_|key_)[0-9A-HJKMNP-TV-Z]{26}$`)
+
+// validateID 校验 repo_id / task_id / chunk_id / key_id 格式。
+func validateID(id string) error {
+	if idRegex.MatchString(id) {
+		return nil
+	}
+	return fmt.Errorf("invalid id format: %q", id)
+}
 
 // DB 连接封装（pgxpool 连接池）。
 type DB struct {

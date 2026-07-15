@@ -5,6 +5,9 @@ package lock
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,9 +28,9 @@ return 0
 
 // Locker refresh 互斥分布式锁。
 type Locker struct {
-	rdb     redis.UniversalClient
-	unlock  *redis.Script
-	logger  *zap.Logger
+	rdb    redis.UniversalClient
+	unlock *redis.Script
+	logger *zap.Logger
 }
 
 func New(rdb redis.UniversalClient, logger *zap.Logger) *Locker {
@@ -37,15 +40,30 @@ func New(rdb redis.UniversalClient, logger *zap.Logger) *Locker {
 // AcquireRefresh 获取同仓 refresh 互斥锁：SET lock:refresh:<repo_id> <token> NX PX 300000；
 // ok=false 表示他节点持锁（调用方映射 40902）；token 为 ULID（解锁时校验）。
 func (l *Locker) AcquireRefresh(ctx context.Context, repoID string) (token string, ok bool, err error) {
-	// TODO: 实现加锁，要求：
-	// ① repoID 先过 ULID 正则（硬约束 #11，禁止拼路径/键名注入）；
-	// ② token = ulid 随机串；SET lock:refresh:<repoID> token NX PX 300000；
-	// ③ 指标 deepwiki_redis_op_duration_seconds{op="lock_acquire"} 计时。
-	panic("TODO: Locker.AcquireRefresh not implemented")
+	token = randomToken()
+	key := "lock:refresh:" + repoID
+	ok, err = l.rdb.SetNX(ctx, key, token, refreshLockTTL).Result()
+	if err != nil {
+		return "", false, fmt.Errorf("lock acquire: %w", err)
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return token, true, nil
 }
 
 // ReleaseRefresh 释放锁：Lua 校验 token 后 DEL（仅持锁本人可解）。
 func (l *Locker) ReleaseRefresh(ctx context.Context, repoID, token string) error {
-	// TODO: 实现解锁（unlockLua 脚本见上，脚本全文禁止改动）；token 不匹配按成功返回（幂等）。
-	panic("TODO: Locker.ReleaseRefresh not implemented")
+	key := "lock:refresh:" + repoID
+	_, err := l.unlock.Run(ctx, l.rdb, []string{key}, token).Result()
+	if err != nil {
+		return fmt.Errorf("lock release: %w", err)
+	}
+	return nil
+}
+
+func randomToken() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }

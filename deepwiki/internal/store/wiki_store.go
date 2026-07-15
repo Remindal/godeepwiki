@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -57,22 +58,104 @@ func NewWikiStore(db *DB, logger *zap.Logger) WikiStore {
 var _ WikiStore = (*pgWikiStore)(nil)
 
 func (s *pgWikiStore) Save(ctx context.Context, w *Wiki) error {
-	// TODO: 单事务覆盖写（基线 §12.3 wiki 重建）：
-	// ① DELETE FROM wiki_pages WHERE repo_id=$1；② 插入 1 行 kind='toc'（toc_json = json.Marshal(w.TOC)，JSONB 列）
-	// + N 行 kind='page'；③ 时间写 time.Now().UTC()，timestamptz 列，API 输出 UTC+RFC3339（硬约束 #13）；
-	// ④ 全部参数化 $n 占位（硬约束 #11）。
-	_ = json.Marshal // 提示：toc_json 用 encoding/json 序列化
-	panic("TODO: pgWikiStore.Save not implemented")
+	if err := validateID(w.RepoID); err != nil {
+		return err
+	}
+	if w.TaskID != "" {
+		if err := validateID(w.TaskID); err != nil {
+			return err
+		}
+	}
+	now := time.Now().UTC()
+	tocJSON, _ := json.Marshal(w.TOC)
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM wiki_pages WHERE repo_id = $1`, w.RepoID); err != nil {
+		return err
+	}
+
+	// 写入 TOC 汇总行
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO wiki_pages (repo_id, slug, kind, title, parent_slug, sort_order, content_md, toc_json, task_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, w.RepoID, "_toc", "toc", "", "", 0, "", tocJSON, w.TaskID, now, now); err != nil {
+		return err
+	}
+
+	// 写入页面行
+	for _, p := range w.Pages {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO wiki_pages (repo_id, slug, kind, title, parent_slug, sort_order, content_md, toc_json, task_id, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, w.RepoID, p.Slug, "page", p.Title, "", p.SortOrder, p.ContentMD, nil, w.TaskID, now, now); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (s *pgWikiStore) Get(ctx context.Context, repoID string) (*Wiki, error) {
-	// TODO: 读出 toc 行（解析 toc_json）与全部 page 行（按 sort_order 升序）；
-	// 无任何行返回 model.ErrWikiNotFound（→ 40403，基线 §6.7）。
-	_ = model.ErrWikiNotFound
-	panic("TODO: pgWikiStore.Get not implemented")
+	if err := validateID(repoID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT repo_id, slug, kind, title, parent_slug, sort_order, content_md, toc_json, task_id, created_at, updated_at
+		FROM wiki_pages
+		WHERE repo_id = $1
+		ORDER BY kind DESC, sort_order ASC, slug ASC
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	wiki := &Wiki{RepoID: repoID}
+	var found bool
+	for rows.Next() {
+		found = true
+		var slug, kind, title, parentSlug string
+		var sortOrder int
+		var contentMD string
+		var tocJSON []byte
+		var taskID string
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(&wiki.RepoID, &slug, &kind, &title, &parentSlug, &sortOrder, &contentMD, &tocJSON, &taskID, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		wiki.TaskID = taskID
+		switch kind {
+		case "toc":
+			_ = json.Unmarshal(tocJSON, &wiki.TOC)
+			wiki.GeneratedAt = updatedAt
+		case "page":
+			wiki.Pages = append(wiki.Pages, WikiPage{
+				Slug:      slug,
+				Title:     title,
+				ContentMD: contentMD,
+				SortOrder: sortOrder,
+				UpdatedAt: updatedAt,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, model.ErrWikiNotFound
+	}
+	return wiki, nil
 }
 
 func (s *pgWikiStore) DeleteByRepo(ctx context.Context, repoID string) error {
-	// TODO: DELETE FROM wiki_pages WHERE repo_id=$1。
-	panic("TODO: pgWikiStore.DeleteByRepo not implemented")
+	if err := validateID(repoID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM wiki_pages WHERE repo_id = $1`, repoID)
+	return err
 }

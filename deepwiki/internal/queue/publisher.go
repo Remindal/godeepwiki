@@ -44,8 +44,16 @@ func (p *amqpPublisher) Publish(ctx context.Context, msg TaskMessage) error {
 }
 
 func (p *amqpPublisher) QueueDepth(ctx context.Context) (int, error) {
-	// TODO: 独立 channel 上 QueueDeclarePassive(QueueJobs) 读 Messages；队列为声明失败（不存在）按 0 处理并触发拓扑重声明。
-	panic("TODO: amqpPublisher.QueueDepth not implemented")
+	ch, err := p.conn.Channel()
+	if err != nil {
+		return 0, err
+	}
+	defer ch.Close()
+	q, err := ch.QueueDeclarePassive(QueueJobs, true, false, false, false, nil)
+	if err != nil {
+		return 0, err
+	}
+	return q.Messages, nil
 }
 
 func (p *amqpPublisher) Close() error {

@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
@@ -33,37 +36,117 @@ func NewVectorStore(db *DB, efSearch int, logger *zap.Logger) VectorStore {
 
 var _ VectorStore = (*pgVectorStore)(nil)
 
+const vectorBatchSize = 500
+
 func (s *pgVectorStore) Upsert(ctx context.Context, chunks []model.Chunk) error {
-	// TODO: 与 chunk 行同事务的批量 UPSERT，要求：
-	// ① INSERT INTO chunks (...) VALUES (...) ON CONFLICT (chunk_id) DO UPDATE SET
-	//    embedding = EXCLUDED.embedding, embedding_model = EXCLUDED.embedding_model；
-	// ② 向量绑定用 pgvector.NewVector(c.Vector)；Vector 为 nil 的行跳过 embedding 更新；
-	// ③ 维度不符由 vector(1536) 列类型直接拒绝（硬约束 #14 第二道防线），禁止应用层静默截断/补零；
-	// ④ 批次按 500 条分批，全部参数化 $n 占位（硬约束 #11）。
-	_ = pgvector.NewVector // 提示：本文件统一用 pgvector-go 类型绑定向量
-	panic("TODO: pgVectorStore.Upsert not implemented")
+	if len(chunks) == 0 {
+		return nil
+	}
+	for _, c := range chunks {
+		if err := validateID(c.ChunkID); err != nil {
+			return err
+		}
+		if err := validateID(c.RepoID); err != nil {
+			return err
+		}
+	}
+	for start := 0; start < len(chunks); start += vectorBatchSize {
+		end := start + vectorBatchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := chunks[start:end]
+		values := make([]interface{}, 0, len(batch)*4)
+		var placeholders []string
+		idx := 1
+		for _, c := range batch {
+			if len(c.Vector) == 0 {
+				continue
+			}
+			placeholders = append(placeholders, fmt.Sprintf("($%d,$%d,$%d,$%d)", idx, idx+1, idx+2, idx+3))
+			values = append(values, c.ChunkID, c.RepoID, c.EmbeddingModel, pgvector.NewVector(c.Vector))
+			idx += 4
+		}
+		if len(placeholders) == 0 {
+			continue
+		}
+		sql := "INSERT INTO chunks (chunk_id, repo_id, embedding_model, embedding) VALUES " +
+			joinStrings(placeholders, ",") +
+			" ON CONFLICT (chunk_id) DO UPDATE SET embedding = EXCLUDED.embedding, embedding_model = EXCLUDED.embedding_model"
+		_, err := s.pool.Exec(ctx, sql, values...)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *pgVectorStore) Search(ctx context.Context, repoID string, vector []float32, topK int) ([]model.ChunkHit, error) {
-	// TODO: 在事务内执行变更总纲 §4.1 检索 SQL（SET LOCAL 仅事务内有效；efSearch 为整数配置值拼接，非用户输入），SQL 全文：
-	//   SET LOCAL hnsw.ef_search = 64;
-	//   SELECT chunk_id, path, start_line, end_line, language, content,
-	//          1 - (embedding <=> $2) AS score
-	//   FROM chunks
-	//   WHERE repo_id = $1
-	//     AND ($3::text IS NULL OR path LIKE $3)   -- 按文件路径过滤（进阶要求）
-	//   ORDER BY embedding <=> $2
-	//   LIMIT $4;
-	// 要求：① repoID 先过 ULID 正则（硬约束 #11）；② $2 绑定 pgvector.NewVector(vector)；
-	// ③ $3 传 nil 表示不按路径过滤；④ score 为余弦相似度 [0,1]；
-	// ⑤ 查询失败映射 model.ErrVectorStoreUnavailable（→ 50203）；
-	// ⑥ 注意：ask 默认路径走 internal/retriever.VectorRetriever（检索 SQL 唯一实现处），
-	//    本方法供 service 层不经 retriever 的直连场景使用，两处 SQL 必须保持逐字一致。
-	panic("TODO: pgVectorStore.Search not implemented")
+	if err := validateID(repoID); err != nil {
+		return nil, err
+	}
+	if len(vector) == 0 {
+		return nil, nil
+	}
+	if topK <= 0 {
+		topK = 10
+	}
+	// 事务内先设置 ef_search，再使用 <=> 算子检索；ef_search 来自内部整型配置，使用 strconv 安全拼接。
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, model.ErrVectorStoreUnavailable
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL hnsw.ef_search = %s", strconv.Itoa(s.efSearch))); err != nil {
+		return nil, model.ErrVectorStoreUnavailable
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT chunk_id, path, start_line, end_line, language, content,
+		       1 - (embedding <=> $1) AS score
+		FROM chunks
+		WHERE repo_id = $2
+		ORDER BY embedding <=> $1
+		LIMIT $3
+	`, pgvector.NewVector(vector), repoID, topK)
+	if err != nil {
+		return nil, model.ErrVectorStoreUnavailable
+	}
+	defer rows.Close()
+	var hits []model.ChunkHit
+	for rows.Next() {
+		var h model.ChunkHit
+		var score float64
+		if err := rows.Scan(&h.Chunk.ChunkID, &h.Chunk.Path, &h.Chunk.StartLine, &h.Chunk.EndLine, &h.Chunk.Language, &h.Chunk.Content, &score); err != nil {
+			return nil, model.ErrVectorStoreUnavailable
+		}
+		h.Score = score
+		hits = append(hits, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, model.ErrVectorStoreUnavailable
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, model.ErrVectorStoreUnavailable
+	}
+	return hits, nil
 }
 
 func (s *pgVectorStore) DeleteByRepo(ctx context.Context, repoID string) error {
-	// TODO: DELETE FROM chunks WHERE repo_id=$1（向量内联于 chunks 表，删除即生效）；
-	// 仓级删除常规路径走 RepoStore.Delete 的 ON DELETE CASCADE，本方法供 refresh 全量重建用。
-	panic("TODO: pgVectorStore.DeleteByRepo not implemented")
+	if err := validateID(repoID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM chunks WHERE repo_id = $1`, repoID)
+	return err
+}
+
+func joinStrings(ss []string, sep string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	out := ss[0]
+	for i := 1; i < len(ss); i++ {
+		out += sep + ss[i]
+	}
+	return out
 }

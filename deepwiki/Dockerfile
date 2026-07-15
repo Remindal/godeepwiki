@@ -2,8 +2,9 @@
 # DeepWiki(Go版) 多阶段构建（Go 1.22+；纯静态二进制，CGO 关闭——全部依赖均为纯 Go 客户端）。
 
 # ---- 构建阶段 ----
-FROM golang:1.22-alpine AS build
+FROM golang:1.24-alpine AS build
 WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
 RUN apk add --no-cache git ca-certificates
 COPY go.mod go.sum ./
 RUN go mod download

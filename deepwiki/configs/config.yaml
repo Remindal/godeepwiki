@@ -71,7 +71,7 @@ storage:
 
 search:
   opensearch:
-    addresses: ["http://localhost:9200"]  # restart_required
+    addresses: ["http://opensearch:9200"]  # restart_required；容器网络内服务名
     username: ""                      # 仅 DEEPWIKI_OPENSEARCH_USERNAME 注入
     password: ""                      # 仅 DEEPWIKI_OPENSEARCH_PASSWORD 注入
     index_prefix: deepwiki            # 索引名 <prefix>-chunks-<repo_id 小写>；restart_required
@@ -84,12 +84,12 @@ queue:
 
 redis:
   sentinel:
-    addresses: ["localhost:26379"]    # DEEPWIKI_REDIS_SENTINEL_ADDRESSES 可覆盖；restart_required
+    addresses: ["redis-sentinel-1:26379", "redis-sentinel-2:26379", "redis-sentinel-3:26379"]  # DEEPWIKI_REDIS_SENTINEL_ADDRESSES 可覆盖；restart_required
     master_name: deepwiki-master
   password: ""                        # 仅 DEEPWIKI_REDIS_PASSWORD 注入
 
 etcd:
-  endpoints: ["localhost:2379"]       # DEEPWIKI_ETCD_ENDPOINTS 可覆盖；restart_required
+  endpoints: ["etcd:2379"]            # ETCD_ENDPOINTS 可覆盖；restart_required
   prefix: /deepwiki                   # 键空间 /deepwiki/config/*、/deepwiki/config_version、/deepwiki/audit/*
 
 git:

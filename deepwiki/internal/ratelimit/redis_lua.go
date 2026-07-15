@@ -42,15 +42,27 @@ func NewRedisLimiter(rdb redis.UniversalClient, logger *zap.Logger) Limiter {
 }
 
 func (l *redisLimiter) Allow(ctx context.Context, key string, window time.Duration, limit int) (Decision, error) {
-	// TODO: 实现判定，要求（总纲 §4.4）：
-	// ① script.Run(ctx, l.rdb, []string{key}, now_ms, window.Milliseconds(), limit) 原子执行；
-	// ② 成功 → 解析 {allowed, remaining} 装配 Decision（ResetUnix=now+window，命中时 RetryAfter≈窗口剩余，
-	//    可由 PTTL 精确化）；degraded 置 false；
-	// ③ Redis 错误（网络/超时/哨兵切换中）→ 降级 l.fallback.allow(key, window, limit) 放行判定 +
-	//    WARN 日志 + degraded 置 true + 指标 deepwiki_ratelimit_degraded_total++
-	//    （可用性优先的有意取舍，总纲 §4.4；恢复成功后 degraded 自动回落 false）；
-	// ④ 指标 deepwiki_redis_op_duration_seconds{op="ratelimit_lua"} 计时。
-	panic("TODO: redisLimiter.Allow not implemented")
+	now := time.Now().UTC()
+	nowMs := now.UnixMilli()
+	res, err := l.script.Run(ctx, l.rdb, []string{key}, nowMs, window.Milliseconds(), limit).Result()
+	if err != nil {
+		l.degraded.Store(true)
+		l.logger.Warn("redis ratelimit failed, fallback to in-process", zap.Error(err))
+		return l.fallback.allow(key, window, limit), nil
+	}
+	l.degraded.Store(false)
+	arr, ok := res.([]any)
+	if !ok || len(arr) != 2 {
+		return l.fallback.allow(key, window, limit), nil
+	}
+	allowed, _ := arr[0].(int64)
+	remaining, _ := arr[1].(int64)
+	return Decision{
+		Allowed:   allowed == 1,
+		Limit:     limit,
+		Remaining: int(remaining),
+		ResetUnix: now.Add(window).Unix(),
+	}, nil
 }
 
 func (l *redisLimiter) Degraded() bool { return l.degraded.Load() }
