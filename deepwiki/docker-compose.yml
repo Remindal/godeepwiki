@@ -1,0 +1,197 @@
+# DeepWiki(Go版) 开发/验收态基础设施（总纲 §3.1）。
+# 用法：make infra-up（= docker compose up -d）→ docker compose ps 确认全部 healthy。
+# 注意：本文件中的 deepwiki/deepwiki 与 guest/guest 仅为开发态默认口令占位，禁止用于生产。
+services:
+  postgres:
+    image: pgvector/pgvector:pg16            # 含 pgvector 扩展（CREATE EXTENSION vector 由迁移完成）
+    container_name: deepwiki-postgres
+    environment:
+      POSTGRES_DB: deepwiki
+      POSTGRES_USER: deepwiki
+      POSTGRES_PASSWORD: deepwiki            # 开发态占位
+    command: postgres -c shared_buffers=256MB
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deepwiki -d deepwiki"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    container_name: deepwiki-opensearch
+    environment:
+      discovery.type: single-node            # 开发态单节点；生产 3 节点 number_of_replicas=1
+      plugins.security.disabled: "true"      # 开发态关安全插件；OPENSEARCH_INITIAL_ADMIN_PASSWORD 仅生产需要
+      bootstrap.memory_lock: "true"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - osdata:/usr/share/opensearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  rabbitmq:
+    image: rabbitmq:3.13.7-management        # management UI：http://localhost:15672（验收拓扑用）
+    container_name: deepwiki-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest           # 开发态占位
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"                          # AMQP
+      - "15672:15672"                        # management UI
+    volumes:
+      - rmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  redis-master:
+    image: redis:7.4.1-alpine
+    container_name: deepwiki-redis-master
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - rdmaster:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-replica-1:
+    image: redis:7.4.1-alpine
+    container_name: deepwiki-redis-replica-1
+    command: redis-server --appendonly yes --replicaof redis-master 6379
+    ports:
+      - "6380:6379"
+    volumes:
+      - rdreplica1:/data
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-replica-2:
+    image: redis:7.4.1-alpine
+    container_name: deepwiki-redis-replica-2
+    command: redis-server --appendonly yes --replicaof redis-master 6379
+    ports:
+      - "6381:6379"
+    volumes:
+      - rdreplica2:/data
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-sentinel-1:
+    image: redis:7.4.1-alpine
+    container_name: deepwiki-redis-sentinel-1
+    # sentinel 配置内联生成：monitor deepwiki-master / down-after 5000ms / failover-timeout 15000ms / quorum 2
+    command: >
+      sh -c "printf 'port 26379\nsentinel monitor deepwiki-master redis-master 6379 2\nsentinel down-after-milliseconds deepwiki-master 5000\nsentinel failover-timeout deepwiki-master 15000\nsentinel parallel-syncs deepwiki-master 1\n' > /tmp/sentinel.conf
+      && redis-server /tmp/sentinel.conf --sentinel"
+    ports:
+      - "26379:26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-sentinel-2:
+    image: redis:7.4.1-alpine
+    container_name: deepwiki-redis-sentinel-2
+    command: >
+      sh -c "printf 'port 26379\nsentinel monitor deepwiki-master redis-master 6379 2\nsentinel down-after-milliseconds deepwiki-master 5000\nsentinel failover-timeout deepwiki-master 15000\nsentinel parallel-syncs deepwiki-master 1\n' > /tmp/sentinel.conf
+      && redis-server /tmp/sentinel.conf --sentinel"
+    ports:
+      - "26380:26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-sentinel-3:
+    image: redis:7.4.1-alpine
+    container_name: deepwiki-redis-sentinel-3
+    command: >
+      sh -c "printf 'port 26379\nsentinel monitor deepwiki-master redis-master 6379 2\nsentinel down-after-milliseconds deepwiki-master 5000\nsentinel failover-timeout deepwiki-master 15000\nsentinel parallel-syncs deepwiki-master 1\n' > /tmp/sentinel.conf
+      && redis-server /tmp/sentinel.conf --sentinel"
+    ports:
+      - "26381:26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.21       # 开发态单节点；生产 3 节点集群（总纲 §3.2）
+    container_name: deepwiki-etcd
+    environment:
+      ETCD_NAME: deepwiki-etcd-0
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd:2380
+      ETCD_INITIAL_CLUSTER: deepwiki-etcd-0=http://etcd:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+    command: ["etcd"]
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcddata:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+  osdata:
+  rmqdata:
+  rdmaster:
+  rdreplica1:
+  rdreplica2:
+  etcddata:

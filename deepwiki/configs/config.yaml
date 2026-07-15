@@ -1,0 +1,103 @@
+# DeepWiki(Go版) 默认配置（基线 §8.1 + 总纲 §5.2 新配置树）。
+# 密钥禁止落 yaml：仅由环境变量注入（硬约束 #2）——
+#   DEEPWIKI_API_KEYS / DEEPWIKI_ADMIN_KEY / DEEPWIKI_EMBEDDING_API_KEY / DEEPWIKI_LLM_API_KEY
+# 基础设施凭据同样禁止落 yaml：
+#   DEEPWIKI_POSTGRES_DSN / DEEPWIKI_OPENSEARCH_USERNAME / DEEPWIKI_OPENSEARCH_PASSWORD /
+#   DEEPWIKI_RABBITMQ_URL / DEEPWIKI_REDIS_PASSWORD
+server:
+  addr: ":8080"                       # restart_required
+  read_timeout: 30s
+  shutdown_timeout: 30s
+  cors_allowed_origins:               # 白名单，禁止 "*"
+    - "http://localhost:3000"
+    - "http://localhost:5173"
+
+rate_limit:                           # 限流数值冻结（总纲 §2.8）；存储为 Redis Lua 滑动窗口
+  per_ip:
+    rps: 10
+    burst: 20
+  per_key:
+    ingest_per_hour: 20
+    ask_per_minute: 30
+    wiki_per_hour: 10
+
+worker:
+  pool_size: 2                        # 同时决定 RabbitMQ 消费端 prefetch（缺省）
+  queue_size: 100                     # = RabbitMQ 主队列 deepwiki.task.jobs 的 x-max-length
+
+ingest:
+  workdir: "./data/repos"
+  max_repo_size_mb: 500
+  chunk_size: 800
+  chunk_overlap: 120
+  include_ext: [.go, .py, .js, .ts, .tsx, .jsx, .java, .md, .txt, .json, .yaml, .yml, .toml, .rs, .cpp, .c, .h, .rb, .php, .sh, .sql, .html, .css]
+  exclude_dirs: [.git, node_modules, vendor, dist, build, target]
+
+embedding:
+  provider: openai                    # openai|dashscope|siliconflow|ollama|voyage
+  model: text-embedding-3-small
+  api_key: ""                         # 禁止明文；仅 DEEPWIKI_EMBEDDING_API_KEY 注入
+  base_url: ""
+  batch_size: 64
+  timeout: 60s
+  retry:
+    max: 3
+    backoff: 2s
+
+llm:
+  provider: openai                    # openai|gemini|claude|ollama|deepseek
+  model: gpt-4o-mini
+  api_key: ""                         # 禁止明文；仅 DEEPWIKI_LLM_API_KEY 注入
+  base_url: ""
+  temperature: 0.2
+  max_tokens: 2048
+  timeout: 120s
+  retry:
+    max: 2
+    backoff: 1s
+
+retriever:
+  mode: hybrid                        # keyword|embedding|hybrid
+  top_k: 8
+  rrf_k: 60
+
+storage:
+  postgres:
+    dsn: ""                           # 禁止 yaml 明文；仅 DEEPWIKI_POSTGRES_DSN 注入；restart_required
+    max_conns: 10                     # pgxpool MaxConns；热更新
+  vector:
+    dimensions: 1536                  # pgvector 列维度；建表定型 restart_required（改维度 = 新迁移 + 全量重建）
+    ef_search: 64                     # HNSW SET LOCAL hnsw.ef_search；热更新
+
+search:
+  opensearch:
+    addresses: ["http://localhost:9200"]  # restart_required
+    username: ""                      # 仅 DEEPWIKI_OPENSEARCH_USERNAME 注入
+    password: ""                      # 仅 DEEPWIKI_OPENSEARCH_PASSWORD 注入
+    index_prefix: deepwiki            # 索引名 <prefix>-chunks-<repo_id 小写>；restart_required
+
+queue:
+  rabbitmq:
+    url: ""                           # 仅 DEEPWIKI_RABBITMQ_URL 注入；restart_required
+    prefetch: 2                       # 缺省 = worker.pool_size；restart_required
+    max_retries: 3                    # DLX 重试链次数；热更新
+
+redis:
+  sentinel:
+    addresses: ["localhost:26379"]    # DEEPWIKI_REDIS_SENTINEL_ADDRESSES 可覆盖；restart_required
+    master_name: deepwiki-master
+  password: ""                        # 仅 DEEPWIKI_REDIS_PASSWORD 注入
+
+etcd:
+  endpoints: ["localhost:2379"]       # DEEPWIKI_ETCD_ENDPOINTS 可覆盖；restart_required
+  prefix: /deepwiki                   # 键空间 /deepwiki/config/*、/deepwiki/config_version、/deepwiki/audit/*
+
+git:
+  op_timeout: 10m                     # 单次 git CLI 操作超时；热更新
+  binary_path: git                    # restart_required
+
+observability:
+  otel_endpoint: ""                   # OTLP gRPC；空 = 禁用（零成本）
+  log:
+    level: info                       # debug|info|warn|error；热更新
+    format: json                      # json|console

@@ -1,0 +1,32 @@
+package model
+
+import (
+	"encoding/json"
+	"time"
+)
+
+// 事件类型（基线 §6.4，冻结；gap 为断线补发空洞提示）。
+const (
+	EventTypeTaskStateChanged = "task.state_changed"
+	EventTypeTaskProgress     = "task.progress"
+	EventTypeWikiCompleted    = "wiki.completed"
+	EventTypeGap              = "gap"
+)
+
+// Event 统一事件。Seq 单调递增，是 SSE id / Last-Event-ID 的依据；
+// 物理载体为 Redis Streams（events:task:<task_id>，XTRIM MAXLEN ~ 1000）。
+// Timestamp 落库/落流均为 UTC + RFC3339（硬约束 #13）。
+type Event struct {
+	Seq       uint64          `json:"seq"`
+	Type      string          `json:"type"`
+	RepoID    string          `json:"repo_id"`
+	TaskID    string          `json:"task_id"`
+	Timestamp time.Time       `json:"timestamp"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// EventFilter 订阅过滤；空 = 全部。
+type EventFilter struct {
+	Types  []string
+	RepoID string
+}

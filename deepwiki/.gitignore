@@ -1,0 +1,15 @@
+# 构建产物
+bin/
+
+# 运行数据（保留 data/.gitkeep）
+data/*
+!data/.gitkeep
+
+# 环境变量与密钥（硬约束 #2）
+.env
+
+# 日志与系统文件
+*.log
+.DS_Store
+.idea/
+.vscode/

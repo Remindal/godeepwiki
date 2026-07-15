@@ -1,0 +1,483 @@
+// DeepWiki(Go版) 服务端入口。
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+
+	"deepwiki/internal/api"
+	"deepwiki/internal/api/handler"
+	"deepwiki/internal/config"
+	"deepwiki/internal/embed"
+	"deepwiki/internal/eventbus"
+	"deepwiki/internal/ingest"
+	"deepwiki/internal/llm"
+	"deepwiki/internal/observability"
+	"deepwiki/internal/queue"
+	"deepwiki/internal/ratelimit"
+	"deepwiki/internal/retriever"
+	"deepwiki/internal/search"
+	"deepwiki/internal/service"
+	"deepwiki/internal/store"
+	"deepwiki/internal/task"
+)
+
+const version = "0.2.0"
+
+func main() {
+	configPath := flag.String("config", "configs/config.yaml", "config file path")
+	flag.Parse()
+
+	// ① 引导配置（viper：yaml + 环境变量；密钥与基础设施凭据仅 env 注入，硬约束 #2）。
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fatal(nil, "load config", err)
+	}
+
+	// ② 结构化日志（zap，生产 JSON）。
+	logger := newLogger(cfg.Observability.Log)
+	defer func() { _ = logger.Sync() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// ③ OpenTelemetry Traces（OTLP endpoint 空则禁用，零成本，总纲 R16）。
+	shutdownTracer, err := observability.InitTracer(ctx, cfg.Observability.OTelEndpoint, "deepwiki", logger)
+	if err != nil {
+		fatal(logger, "init otel tracer", err)
+	}
+	metrics := observability.Register()
+
+	// ④ etcd：连接 → 全量读 /deepwiki/config/ 前缀叠加运行时覆写 → Watch 热更新（硬约束 #9，总纲 §4.5）。
+	etcdSrc, err := config.NewEtcdSource(ctx, cfg.Etcd.Endpoints, cfg.Etcd.Prefix, logger)
+	if err != nil {
+		fatal(logger, "connect etcd", err)
+	}
+	overrides, cfgVersion, err := etcdSrc.LoadAll(ctx)
+	if err != nil {
+		fatal(logger, "load config overrides from etcd", err)
+	}
+	cm := config.NewManager(config.MergeOverrides(cfg, overrides), cfgVersion, etcdSrc, logger)
+	go cm.StartWatch(ctx)
+
+	// ⑤ Postgres 连接池（pgxpool：MaxConns=10, MinConns=2, MaxConnLifetime=1h, HealthCheckPeriod=30s，总纲 §4.1）。
+	db, err := store.Open(ctx, cfg.Storage.Postgres.DSN, cfg.Storage.Postgres.MaxConns, logger)
+	if err != nil {
+		fatal(logger, "connect postgres", err)
+	}
+	pool := db.Pool()
+
+	// ⑥ golang-migrate Up（embed.FS source；dirty 状态 panic 退出并提示 migrate force，只前进原则，总纲 R4）。
+	if err := store.Migrate(cfg.Storage.Postgres.DSN, logger); err != nil {
+		fatal(logger, "migrate", err)
+	}
+
+	// ⑦ OpenSearch 客户端 + 启动一致性校验（每仓 count(index) == chunks 表行数，总纲 §4.2）。
+	searchCli, err := search.NewClient(ctx, cfg.Search.OpenSearch, logger)
+	if err != nil {
+		fatal(logger, "connect opensearch", err)
+	}
+	chunkStore := store.NewChunkStore(db, logger)
+	repoStore := store.NewRepoStore(db, logger)
+	go verifyIndices(ctx, repoStore, chunkStore, searchCli, logger)
+
+	// ⑧ Redis 哨兵 FailoverClient（总纲 §4.4；地址与密码仅环境变量/引导层注入）。
+	rdb := redis.NewFailoverClient(&redis.FailoverOptions{
+		MasterName:    cfg.Redis.Sentinel.MasterName,
+		SentinelAddrs: cfg.Redis.Sentinel.Addresses,
+		Password:      cfg.Redis.Password,
+	})
+	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		pingCancel()
+		fatal(logger, "connect redis via sentinel", err)
+	}
+	pingCancel()
+	logger.Info("redis sentinel master discovered", zap.String("master_name", cfg.Redis.Sentinel.MasterName))
+
+	// ⑨ RabbitMQ 连接 + 拓扑声明（exchange deepwiki.tasks / 主队列 x-max-length=100 / DLX / 重试 TTL 链，总纲 §4.3）。
+	mq, err := queue.Dial(ctx, cfg.Queue.RabbitMQ.URL, cfg.Worker.QueueSize, logger)
+	if err != nil {
+		fatal(logger, "connect rabbitmq", err)
+	}
+	if err := mq.DeclareTopology(ctx); err != nil {
+		fatal(logger, "declare rabbitmq topology", err)
+	}
+	publisher := queue.NewPublisher(mq, logger)
+	consumer := queue.NewConsumer(mq, cfg.Queue.RabbitMQ.Prefetch, logger)
+
+	// ⑩ Reconciler 启动恢复（总纲 §4.3：pending 重投；running 超 5 分钟无心跳重置 pending 重投，幂等 CAS）。
+	taskStore := task.NewTaskStore(pool, logger)
+	reconciler := queue.NewReconciler(taskStore, publisher, logger)
+	if err := reconciler.Recover(ctx); err != nil {
+		// 恢复失败不阻断启动（DLQ/周期巡检兜底），但必须 ERROR 留痕。
+		logger.Error("reconciler recover failed", zap.Error(err))
+	}
+
+	// ⑪ 统一任务系统：事件总线（Redis Streams + Pub/Sub 扇出）+ 消费端 + 有界 Worker Pool。
+	bus := eventbus.NewRedisStreamsBus(rdb, logger)
+	go bus.StartFanout(ctx)
+	tm := task.NewManager(taskStore, bus, publisher, cfg.Worker, logger)
+	// ingest/refresh/wiki 三个 Executor 在各自模块迭代落地后注册（tm.RegisterExecutor(...)）；
+	// 未注册类型的任务被消费时落 failed/50001，不会阻塞其他类型。
+	tm.Start(ctx, consumer)
+
+	// ⑫ git 可用性探测（git --version；缺失 → health degraded，总纲 §4.6）。
+	gitVersion, gitOK := probeGit(ctx, cfg.Git.BinaryPath)
+	if !gitOK {
+		logger.Error("git binary not available", zap.String("binary_path", cfg.Git.BinaryPath))
+	}
+
+	// Provider 与检索装配（构造函数均为纯装配，不发起网络调用；官方 SDK adapter，硬约束 #17）。
+	emb, err := embed.New(cfg.Embedding, logger)
+	if err != nil {
+		fatal(logger, "build embedder", err)
+	}
+	llmClient, err := llm.New(cfg.LLM, logger)
+	if err != nil {
+		fatal(logger, "build llm", err)
+	}
+
+	// ⑬ 装配 gin（中间件链：RequestID → Recovery → CORS → Auth → RateLimit，硬约束 #1/#2）。
+	limiter := ratelimit.NewRedisLimiter(rdb, logger)
+	snapshot := handler.NewHealthSnapshot()
+	apiKeyStore := store.NewAPIKeyStore(db, logger)
+	wikiStore := store.NewWikiStore(db, logger)
+	vectorStore := store.NewVectorStore(db, cfg.Storage.Vector.EFSearch, logger)
+	cloner := ingest.NewGitCloner(cfg.Git.BinaryPath, cfg.Git.OpTimeout, logger)
+	retrievers := buildRetrievers(searchCli, chunkStore, vectorStore, pool, emb, cfg, logger)
+
+	ingestSvc := service.NewIngestService(tm, repoStore, cloner, publisher, cm, logger)
+	repoSvc := service.NewRepoService(repoStore, chunkStore, vectorStore, wikiStore, searchCli, tm, logger)
+	askSvc := service.NewAskService(cm, retrievers, llmClient, logger)
+	wikiSvc := service.NewWikiService(tm, wikiStore, logger)
+
+	ready := &atomic.Bool{}
+	ready.Store(true)
+	router := api.NewRouter(api.Deps{
+		Logger:    logger,
+		Cfg:       cm,
+		Version:   version,
+		StartTime: time.Now().UTC(),
+		Ready:     ready,
+		Snapshot:  snapshot,
+		Tasks:     tm,
+		Bus:       bus,
+		Replayer:  bus,
+		Limiter:   limiter,
+		KeyCache:  rdb,
+		APIKeys:   apiKeyStore,
+		IngestSvc: ingestSvc,
+		RepoSvc:   repoSvc,
+		AskSvc:    askSvc,
+		WikiSvc:   wikiSvc,
+	})
+
+	// ⑭ 后台 health 探测循环（60s；health 接口只读快照，毫秒级返回，总纲 §7）。
+	probe := &healthProber{
+		cfg: cm, pool: pool, searchCli: searchCli, publisher: publisher, rdb: rdb,
+		etcdSrc: etcdSrc, emb: emb, llmCli: llmClient, gitBinary: cfg.Git.BinaryPath,
+		gitVersion: gitVersion, gitOK: gitOK, limiter: limiter, metrics: metrics,
+		snapshot: snapshot, logger: logger,
+	}
+	go probe.loop(ctx, 60*time.Second)
+
+	srv := &http.Server{
+		Addr:        cfg.Server.Addr,
+		Handler:     router,
+		ReadTimeout: cfg.Server.ReadTimeout,
+	}
+	go func() {
+		logger.Info("deepwiki listening", zap.String("addr", cfg.Server.Addr), zap.String("version", version))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fatal(logger, "http server", err)
+		}
+	}()
+
+	<-ctx.Done()
+	// ⑮ 优雅退出（硬约束 #10，总纲 §4.3 语义平移）：
+	// readiness 置失败（health 返回 503 + 50301）→ 停接新请求 → consumer 停拉新消息 →
+	// 等在途任务完成（上限 server.shutdown_timeout）→ 未完成者 nack requeue=true 让别的节点接走 →
+	// 按序关连接：rabbitmq → redis → opensearch → postgres → etcd → flush 日志（禁止连接泄漏）。
+	logger.Info("shutting down")
+	ready.Store(false)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http shutdown error", zap.Error(err))
+	}
+	if err := consumer.Stop(context.Background()); err != nil {
+		logger.Error("stop consumer error", zap.Error(err))
+	}
+	tm.Stop(shutdownCtx) // 等在途 → 未完成 nack requeue=true（硬约束 #10）
+	bus.Close()
+	if err := publisher.Close(); err != nil {
+		logger.Error("close rabbitmq publisher error", zap.Error(err))
+	}
+	if err := mq.Close(); err != nil { // ① rabbitmq
+		logger.Error("close rabbitmq error", zap.Error(err))
+	}
+	if err := rdb.Close(); err != nil { // ② redis
+		logger.Error("close redis error", zap.Error(err))
+	}
+	if err := searchCli.Close(); err != nil { // ③ opensearch
+		logger.Error("close opensearch error", zap.Error(err))
+	}
+	db.Close() // ④ postgres
+	if err := etcdSrc.Close(); err != nil { // ⑤ etcd
+		logger.Error("close etcd error", zap.Error(err))
+	}
+	if err := shutdownTracer(context.Background()); err != nil {
+		logger.Error("shutdown tracer error", zap.Error(err))
+	}
+	logger.Info("bye") // ⑥ flush 日志由 defer logger.Sync() 完成
+}
+
+// healthProber 60s 后台探测循环：聚合全部依赖状态写 HealthSnapshot（health 接口毫秒级返回的数据源）。
+type healthProber struct {
+	cfg        *config.Manager
+	pool       *pgxpool.Pool
+	searchCli  *search.Client
+	publisher  queue.Publisher
+	rdb        redis.UniversalClient
+	etcdSrc    *config.EtcdSource
+	emb        embed.Embedder
+	llmCli     llm.LLM
+	gitBinary  string
+	gitVersion string
+	gitOK      bool
+	limiter    ratelimit.Limiter
+	metrics    *observability.Metrics
+	snapshot   *handler.HealthSnapshot
+	logger     *zap.Logger
+}
+
+// loop 每 interval 探测一轮并刷新快照；goroutine 随 ctx 取消退出（硬约束 #4）。
+func (p *healthProber) loop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	p.probeOnce(ctx) // 启动即探测一轮，避免 health 长时间 degraded
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.probeOnce(ctx)
+		}
+	}
+}
+
+// probeOnce 单轮探测：任一依赖异常 → status=degraded（postgres/opensearch/rabbitmq/redis/etcd
+// 任一异常 → degraded，readiness 503 + 50301 语义不变，总纲 §6/§7）。
+func (p *healthProber) probeOnce(ctx context.Context) {
+	defer func() { // 单轮探测 panic 不得拖垮进程（硬约束 #4）
+		if r := recover(); r != nil {
+			p.logger.Error("health probe panic", zap.Any("panic", r))
+		}
+	}()
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	degraded := false
+	snap := p.snapshot.Load()
+
+	// Postgres：Ping + 连接池状态 + 迁移版本（schema_migrations）。
+	pgOK := p.pool.Ping(probeCtx) == nil
+	stat := p.pool.Stat()
+	snap.Postgres.Connected = pgOK
+	snap.Postgres.Pool.Total = stat.TotalConns()
+	snap.Postgres.Pool.Idle = stat.IdleConns()
+	if !pgOK {
+		degraded = true
+	}
+
+	// OpenSearch：cluster health + 索引计数。
+	clusterStatus, indices, osErr := p.searchCli.Ping(probeCtx)
+	snap.OpenSearch.Connected = osErr == nil
+	snap.OpenSearch.ClusterStatus = clusterStatus
+	snap.OpenSearch.Indices = indices
+	if osErr != nil {
+		degraded = true
+	}
+
+	// RabbitMQ：主队列深度（QueueDeclarePassive）；指标 deepwiki_queue_length / rabbitmq_queue_depth。
+	depth, mqErr := p.publisher.QueueDepth(probeCtx)
+	snap.RabbitMQ.Connected = mqErr == nil
+	snap.RabbitMQ.QueueDepth = depth
+	if mqErr == nil {
+		p.metrics.QueueLength.Set(float64(depth))
+		p.metrics.RabbitMQQueueDepth.WithLabelValues("deepwiki.task.jobs").Set(float64(depth))
+	} else {
+		degraded = true
+	}
+
+	// Redis 哨兵：Ping + 当前主地址（FailoverClient 故障转移后 Options().Addr 自动指向新主）；
+	// ratelimit_degraded 反映降级兜底状态（总纲 §4.4）。
+	redisOK := p.rdb.Ping(probeCtx).Err() == nil
+	snap.Redis.Connected = redisOK
+	snap.Redis.Mode = "sentinel"
+	if cli, ok := p.rdb.(*redis.Client); ok {
+		snap.Redis.Master = cli.Options().Addr
+	} else {
+		snap.Redis.Master = p.cfg.Get().Redis.Sentinel.MasterName
+	}
+	snap.Redis.RatelimitDegraded = p.limiter.Degraded()
+	if !redisOK {
+		degraded = true
+	}
+
+	// etcd：Healthy + endpoints。
+	etcdOK := p.etcdSrc.Healthy(probeCtx)
+	snap.Etcd.Connected = etcdOK
+	snap.Etcd.Endpoints = p.etcdSrc.Endpoints()
+	if !etcdOK {
+		degraded = true
+	}
+
+	// git CLI：缓存启动探测结果，周期复验。
+	if v, ok := probeGit(probeCtx, p.gitBinary); ok {
+		p.gitVersion, p.gitOK = v, true
+	} else {
+		p.gitOK = false
+	}
+	snap.Git.Available = p.gitOK
+	snap.Git.Version = p.gitVersion
+	if !p.gitOK {
+		degraded = true
+	}
+
+	// LLM / Embedding：启动探测 + gobreaker 状态（下一轮 adapter 落地 reachabilityProber 后生效；
+	// 骨架阶段固定 reachable=false → degraded，验收标准允许）。
+	snap.LLM.Reachable = probeProvider(probeCtx, p.llmCli)
+	snap.LLM.Breaker = breakerStateOf(p.llmCli)
+	snap.Embedding.Reachable = probeProvider(probeCtx, p.emb)
+	snap.Embedding.Breaker = breakerStateOf(p.emb)
+	if !snap.LLM.Reachable || !snap.Embedding.Reachable {
+		degraded = true
+	}
+
+	if degraded {
+		snap.Status = "degraded"
+	} else {
+		snap.Status = "ok"
+	}
+	p.snapshot.Store(snap)
+}
+
+// reachabilityProber provider 可达性探测契约（embed/llm adapter 下一轮实现：轻量 Ping + gobreaker 状态；
+// 硬约束 #7 外部调用韧性：SDK 内置重试优先 + gobreaker 熔断，连续失败 ≥5 → open → health degraded）。
+type reachabilityProber interface {
+	Ping(ctx context.Context) error
+	BreakerState() string // closed|open|half-open（gobreaker，总纲 R8）
+}
+
+func probeProvider(ctx context.Context, provider any) bool {
+	pr, ok := provider.(reachabilityProber)
+	if !ok {
+		return false // 骨架阶段：未实现探测契约按不可达处理（degraded）
+	}
+	return pr.Ping(ctx) == nil
+}
+
+func breakerStateOf(provider any) string {
+	if pr, ok := provider.(reachabilityProber); ok {
+		return pr.BreakerState()
+	}
+	return "closed"
+}
+
+// buildRetrievers 检索三件套装配（keyword=OpenSearch BM25、embedding=pgvector HNSW、hybrid=RRF 融合）。
+func buildRetrievers(searchCli *search.Client, chunks store.ChunkStore, vectors store.VectorStore, pool *pgxpool.Pool, emb embed.Embedder, cfg *config.Config, logger *zap.Logger) map[string]retriever.Retriever {
+	kw := retriever.NewKeywordRetriever(searchCli, chunks, logger)
+	vec := retriever.NewVectorRetriever(pool, emb, cfg.Storage.Vector.EFSearch, logger)
+	hyb := retriever.NewHybridRetriever(kw, vec, cfg.Retriever.RRFK, logger)
+	return map[string]retriever.Retriever{"keyword": kw, "embedding": vec, "hybrid": hyb}
+}
+
+// verifyIndices 启动一致性校验（总纲 §4.2）：每仓 count(index) == chunks 表行数，
+// 不一致 → WARN 并后台重建该仓索引。store 方法签名以 §5.6 为准。
+func verifyIndices(ctx context.Context, repos store.RepoStore, chunks store.ChunkStore, searchCli *search.Client, logger *zap.Logger) {
+	defer func() { // 校验失败不得拖垮启动（硬约束 #4）
+		if r := recover(); r != nil {
+			logger.Error("verify indices panic", zap.Any("panic", r))
+		}
+	}()
+	repoIDs, err := repos.ListRepoIDs(ctx)
+	if err != nil {
+		logger.Error("verify indices: list repos failed", zap.Error(err))
+		return
+	}
+	for _, repoID := range repoIDs {
+		want, err := chunks.CountByRepo(ctx, repoID)
+		if err != nil {
+			logger.Error("verify indices: count chunks failed", zap.String("repo_id", repoID), zap.Error(err))
+			continue
+		}
+		got, err := searchCli.Count(ctx, repoID)
+		if err != nil {
+			logger.Error("verify indices: count index failed", zap.String("repo_id", repoID), zap.Error(err))
+			continue
+		}
+		if got != want {
+			logger.Warn("verify indices: mismatch, schedule rebuild",
+				zap.String("repo_id", repoID), zap.Int64("postgres", want), zap.Int64("opensearch", got))
+			// 下一轮：投递该仓索引重建任务（bulk 全量重写，幂等 _id=chunk_id）。
+		}
+	}
+	logger.Info("opensearch indices verified", zap.Int("repos", len(repoIDs)))
+}
+
+// probeGit git CLI 可用性探测（git --version 解析版本号，总纲 §4.6；
+// exec.CommandContext 直调，禁止 sh -c 拼接，硬约束 #5）。
+func probeGit(ctx context.Context, binary string) (string, bool) {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, binary, "--version").Output()
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Fields(string(out)) // 形如 "git version 2.43.0"
+	if len(fields) >= 3 {
+		return fields[2], true
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+func newLogger(cfg config.LogConfig) *zap.Logger {
+	var zc zap.Config
+	if cfg.Format == "console" {
+		zc = zap.NewDevelopmentConfig()
+	} else {
+		zc = zap.NewProductionConfig()
+	}
+	if lvl, err := zap.ParseAtomicLevel(cfg.Level); err == nil {
+		zc.Level = lvl
+	}
+	logger, err := zc.Build()
+	if err != nil {
+		fatal(nil, "build logger", err)
+	}
+	return logger
+}
+
+func fatal(logger *zap.Logger, msg string, err error) {
+	if logger != nil {
+		logger.Fatal(msg, zap.Error(err))
+	}
+	fmt.Fprintf(os.Stderr, "fatal: %s: %v\n", msg, err)
+	os.Exit(1)
+}
