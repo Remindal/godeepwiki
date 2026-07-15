@@ -1,5 +1,10 @@
 # 构建产物
 bin/
+*.exe
+*.dll
+*.so
+*.test
+*.out
 
 # 运行数据（保留 data/.gitkeep）
 data/*
@@ -13,3 +18,12 @@ data/*
 .DS_Store
 .idea/
 .vscode/
+
+# Go 特有
+vendor/
+coverage.out
+profile.out
+__debug_bin*
+
+# Docker
+docker-compose.override.yml
