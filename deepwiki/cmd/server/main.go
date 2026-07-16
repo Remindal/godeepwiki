@@ -71,7 +71,7 @@ func main() {
 	if err != nil {
 		fatal(logger, "load config overrides from etcd", err)
 	}
-	cm := config.NewManager(config.MergeOverrides(cfg, overrides), cfgVersion, etcdSrc, logger)
+	cm := config.NewManager(cfg, overrides, cfgVersion, etcdSrc, logger)
 	go cm.StartWatch(ctx)
 
 	// ⑤ Postgres 连接池（pgxpool：MaxConns=10, MinConns=2, MaxConnLifetime=1h, HealthCheckPeriod=30s，总纲 §4.1）。
