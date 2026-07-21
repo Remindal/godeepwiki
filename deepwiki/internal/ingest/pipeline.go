@@ -2,6 +2,9 @@ package ingest
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -46,6 +49,98 @@ type Stage struct {
 	Fn   StageFunc
 }
 
+// StageWeights 各阶段占整体进度的百分比（基线 §4.4 冻结）：
+// ingest 15/10/10/50/15，refresh 20/10/10/45/15，wiki 10/90。
+var StageWeights = map[model.TaskState]int{
+	model.TaskStateCloning:    15,
+	model.TaskStateParsing:    10,
+	model.TaskStateChunking:   10,
+	model.TaskStateEmbedding:  50,
+	model.TaskStatePersisting: 15,
+	model.TaskStateFetching:   20,
+	model.TaskStateDiffing:    10,
+	model.TaskStateOutlining:  10,
+	model.TaskStateGenerating: 90,
+}
+
+// StageError 阶段失败包装；Worker 据 Stage 填 task.error.stage。
+type StageError struct {
+	Stage model.TaskState
+	Err   error
+}
+
+func (e *StageError) Error() string { return fmt.Sprintf("stage %s: %v", e.Stage, e.Err) }
+func (e *StageError) Unwrap() error { return e.Err }
+
+// Embedder  embedding 阶段依赖（结构型接口，由 service 层注入 embed.Embedder 实现）。
+type Embedder interface {
+	Embed(ctx context.Context, texts []string) ([][]float32, error)
+	ModelName() string
+}
+
+// ChunkPersister persisting 阶段依赖（结构型接口，由 service 层注入 store.ChunkStore 实现）。
+type ChunkPersister interface {
+	InsertBatch(ctx context.Context, chunks []model.Chunk) error
+}
+
+// StageDeps 六阶段装配依赖。
+type StageDeps struct {
+	Cloner   Cloner
+	Embedder Embedder
+	Chunks   ChunkPersister
+}
+
+// NewIngestStages 装配 ingest 五阶段（pending 与 completed 由 Run 首尾处理）：
+// cloning → parsing → chunking → embedding → persisting。
+func NewIngestStages(deps StageDeps) []Stage {
+	return []Stage{
+		{Name: model.TaskStateCloning, Fn: func(ctx context.Context, pc *PipelineContext) error {
+			return deps.Cloner.Clone(ctx, pc.Repo.RepoURL, pc.Repo.Branch, pc.WorkDir)
+		}},
+		{Name: model.TaskStateParsing, Fn: func(ctx context.Context, pc *PipelineContext) error {
+			files, err := ParseFiles(ctx, pc.WorkDir, pc.Options)
+			if err != nil {
+				return err
+			}
+			pc.Files = files
+			return nil
+		}},
+		{Name: model.TaskStateChunking, Fn: func(ctx context.Context, pc *PipelineContext) error {
+			chunks, err := ChunkFiles(ctx, pc.Repo.RepoID, pc.Files, pc.Options)
+			if err != nil {
+				return err
+			}
+			pc.Chunks = chunks
+			return nil
+		}},
+		{Name: model.TaskStateEmbedding, Fn: func(ctx context.Context, pc *PipelineContext) error {
+			if len(pc.Chunks) == 0 {
+				return nil
+			}
+			texts := make([]string, len(pc.Chunks))
+			for i, c := range pc.Chunks {
+				texts[i] = c.Content
+			}
+			vectors, err := deps.Embedder.Embed(ctx, texts)
+			if err != nil {
+				return err
+			}
+			if len(vectors) != len(pc.Chunks) {
+				return fmt.Errorf("embedder returned %d vectors for %d chunks", len(vectors), len(pc.Chunks))
+			}
+			modelName := deps.Embedder.ModelName()
+			for i := range pc.Chunks {
+				pc.Chunks[i].Vector = vectors[i]
+				pc.Chunks[i].EmbeddingModel = modelName
+			}
+			return nil
+		}},
+		{Name: model.TaskStatePersisting, Fn: func(ctx context.Context, pc *PipelineContext) error {
+			return deps.Chunks.InsertBatch(ctx, pc.Chunks)
+		}},
+	}
+}
+
 // Pipeline 顺序阶段执行器。
 type Pipeline struct {
 	stages []Stage
@@ -60,11 +155,80 @@ func NewPipeline(stages []Stage, bus eventbus.EventBus, logger *zap.Logger) *Pip
 // report 进度回调：由调用方（Worker）实现 UpdateState + 落库节流（每 500ms 或每推进 5% 一次，基线 §4.4）。
 type ProgressReport func(state model.TaskState, progress model.Progress, stats model.Stats) error
 
+// Run 顺序执行各阶段：每阶段入口检查 ctx 取消，阶段开始实时回调 report 并发布
+// task.state_changed 事件；阶段失败返回带 stage 信息的 StageError；全部完成后按
+// completed + 100% 收尾。进度落库节流在 Worker 侧实现，本函数只负责实时回调。
 func (p *Pipeline) Run(ctx context.Context, pc *PipelineContext, report ProgressReport) error {
-	// TODO: 顺序执行 p.stages，要求：
-	// ① 每阶段入口必须 select ctx.Done()，取消时返回 ctx.Err()（反 AI 错误 #4，Worker 据此落 cancelled）；
-	// ② 每阶段开始调用 report(stage.Name, ...) 并向 p.bus.Publish task.state_changed 事件（结构化字段，禁止拼字符串）；
-	// ③ 阶段错误原样返回（错误须带 stage 信息，供 Worker 落 failed 时填 error.stage）；
-	// ④ 进度落库节流在 Worker 侧实现，本函数只负责实时回调。
-	panic("TODO: Pipeline.Run not implemented")
+	cumulative := 0
+	for _, stage := range p.stages {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		progress := model.Progress{Current: cumulative, Total: 100, Percent: cumulative}
+		stats := snapshotStats(pc)
+		if report != nil {
+			if err := report(stage.Name, progress, stats); err != nil {
+				return err
+			}
+		}
+		p.publishState(ctx, pc, stage.Name, progress, stats)
+
+		if err := stage.Fn(ctx, pc); err != nil {
+			return &StageError{Stage: stage.Name, Err: err}
+		}
+		cumulative += StageWeights[stage.Name]
+	}
+
+	progress := model.Progress{Current: 100, Total: 100, Percent: 100}
+	stats := snapshotStats(pc)
+	if report != nil {
+		if err := report(model.TaskStateCompleted, progress, stats); err != nil {
+			return err
+		}
+	}
+	p.publishState(ctx, pc, model.TaskStateCompleted, progress, stats)
+	return nil
+}
+
+// snapshotStats 从 PipelineContext 中间产物汇总 Stats（token 数为切分同一口径的粗估值）。
+func snapshotStats(pc *PipelineContext) model.Stats {
+	stats := model.Stats{Files: len(pc.Files), Chunks: len(pc.Chunks)}
+	for _, c := range pc.Chunks {
+		stats.Tokens += EstimateTokens(c.Content)
+	}
+	return stats
+}
+
+// stateChangedPayload task.state_changed 事件载荷（结构化字段，禁止拼字符串）。
+type stateChangedPayload struct {
+	State    model.TaskState `json:"state"`
+	Progress model.Progress  `json:"progress"`
+	Stats    model.Stats     `json:"stats"`
+}
+
+// publishState 发布状态事件；发布失败只记 WARN 不中断 Pipeline（任务状态以 Postgres 为准）。
+func (p *Pipeline) publishState(ctx context.Context, pc *PipelineContext, state model.TaskState, progress model.Progress, stats model.Stats) {
+	if p.bus == nil {
+		return
+	}
+	payload, err := json.Marshal(stateChangedPayload{State: state, Progress: progress, Stats: stats})
+	if err != nil {
+		p.logger.Warn("marshal state_changed payload failed", zap.Error(err))
+		return
+	}
+	ev := model.Event{
+		Type:      model.EventTypeTaskStateChanged,
+		TaskID:    pc.Task.TaskID,
+		Timestamp: time.Now().UTC(),
+		Payload:   payload,
+	}
+	if pc.Repo != nil {
+		ev.RepoID = pc.Repo.RepoID
+	}
+	if err := p.bus.Publish(ctx, ev); err != nil {
+		p.logger.Warn("publish task.state_changed failed", zap.String("task_id", pc.Task.TaskID), zap.String("state", string(state)), zap.Error(err))
+	}
 }
