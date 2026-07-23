@@ -1,9 +1,19 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"deepwiki/internal/api/dto"
+	"deepwiki/internal/api/middleware"
+	"deepwiki/internal/model"
 	"deepwiki/internal/service"
 )
 
@@ -18,19 +28,143 @@ func NewAskHandler(svc *service.AskService, logger *zap.Logger) *AskHandler {
 }
 
 func (h *AskHandler) Ask(c *gin.Context) {
-	// TODO: POST /api/v1/ask（§6.2）：ShouldBindJSON dto.AskRequest + 校验
-	// （repo_id 格式；question 长度 1~4000；mode ∈ keyword|embedding|hybrid；top_k 1~30）→ 40001 + details；
-	// 成功 200 + dto.AskResponse；仓库非 ready → 40902；LLM 不可用 → 50201；Embedding 不可用 → 50202；
-	// OpenSearch 不可用 → 50303；pgvector 查询失败 → 50203；限流桶 L1 per-IP + L2 ask_per_minute。
-	respondNotImplemented(c)
+	var req dto.AskRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, model.CodeInvalidParam, "invalid json body", []model.ErrorDetail{{Field: "body", Issue: err.Error()}})
+		return
+	}
+	if details := validateAskRequest(req); len(details) > 0 {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), details)
+		return
+	}
+
+	resp, err := h.svc.Ask(c.Request.Context(), req)
+	if err != nil {
+		h.handleError(c, err)
+		return
+	}
+	respondOK(c, resp)
 }
 
 func (h *AskHandler) AskStream(c *gin.Context) {
-	// TODO: POST /api/v1/ask/stream（§6.3 SSE）：
-	// ① 响应头 Content-Type: text/event-stream、Cache-Control: no-cache、Connection: keep-alive、X-Accel-Buffering: no；
-	// ② 事件 id 为连接内单调递增序号；每 15s 一行 ": heartbeat" 心跳；
-	// ③ 事件顺序 references（恰好 1）→ token（0~N）→ done（恰好 1）；error 任意位置终止流；
-	// ④ 客户端断开 → ctx 取消 → 中断 LLM 流并退出 goroutine（硬约束 #4）；
-	// ⑤ 校验失败在升级 SSE 前返回 40001 信封。
-	respondNotImplemented(c)
+	var req dto.AskRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, model.CodeInvalidParam, "invalid json body", []model.ErrorDetail{{Field: "body", Issue: err.Error()}})
+		return
+	}
+	if details := validateAskRequest(req); len(details) > 0 {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), details)
+		return
+	}
+
+	// SSE 响应头。
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		respondError(c, model.CodeInternalError, "streaming not supported", nil)
+		return
+	}
+
+	ctx := c.Request.Context()
+	var mu sync.Mutex
+	var eventID int64
+	writeEvent := func(event string, payload any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		eventID++
+		_, err = fmt.Fprintf(c.Writer, "id: %d\nevent: %s\ndata: %s\n\n", eventID, event, data)
+		if err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	// 心跳 goroutine：每 15s 一行注释心跳。
+	heartbeatDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeatDone:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				_, _ = c.Writer.WriteString(": heartbeat\n\n")
+				flusher.Flush()
+				mu.Unlock()
+			}
+		}
+	}()
+	defer close(heartbeatDone)
+
+	if err := h.svc.AskStream(ctx, req, writeEvent); err != nil {
+		// 若已经开始流式输出，则以 error 事件终止；否则返回错误信封。
+		if eventID > 0 {
+			_ = writeEvent("error", dto.StreamErrorEvent{Code: errorCodeOf(err), Message: errorMessageOf(err), RequestID: middleware.GetRequestID(c)})
+			return
+		}
+		h.handleError(c, err)
+		return
+	}
+}
+
+func validateAskRequest(req dto.AskRequest) []model.ErrorDetail {
+	var details []model.ErrorDetail
+	if !validRepoID(req.RepoID) {
+		details = append(details, invalidRepoIDDetail("repo_id")...)
+	}
+	if req.Question == "" || len(req.Question) > 4000 {
+		details = append(details, model.ErrorDetail{Field: "question", Issue: "length must be between 1 and 4000"})
+	}
+	if req.Mode != "" && req.Mode != "keyword" && req.Mode != "embedding" && req.Mode != "hybrid" {
+		details = append(details, model.ErrorDetail{Field: "mode", Issue: "must be one of keyword|embedding|hybrid"})
+	}
+	if req.TopK != nil && (*req.TopK < 1 || *req.TopK > 30) {
+		details = append(details, model.ErrorDetail{Field: "top_k", Issue: "must be between 1 and 30"})
+	}
+	return details
+}
+
+func (h *AskHandler) handleError(c *gin.Context, err error) {
+	var apiErr *model.APIError
+	if errors.As(err, &apiErr) {
+		respondError(c, apiErr.Code, apiErr.Message, apiErr.Details)
+		return
+	}
+	switch {
+	case errors.Is(err, model.ErrRepoNotFound):
+		respondError(c, model.CodeRepoNotFound, model.MessageOf(model.CodeRepoNotFound), nil)
+	default:
+		h.logger.Error("ask failed", zap.Error(err))
+		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)
+	}
+}
+
+func errorCodeOf(err error) int {
+	var apiErr *model.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code
+	}
+	return model.CodeInternalError
+}
+
+func errorMessageOf(err error) string {
+	var apiErr *model.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Message
+	}
+	return model.MessageOf(model.CodeInternalError)
 }

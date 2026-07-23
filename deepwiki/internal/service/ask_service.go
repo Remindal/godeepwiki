@@ -2,6 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 
@@ -10,46 +15,244 @@ import (
 	"deepwiki/internal/llm"
 	"deepwiki/internal/model"
 	"deepwiki/internal/retriever"
+	"deepwiki/internal/store"
 )
 
-// AskService 问答编排（§6.2、§6.3；Ask 不得直接访问 pgvector/OpenSearch，只面向 Retriever 接口，建议⑥——
-// keyword 实现走 OpenSearch BM25（总纲 §4.2），embedding 实现走 pgvector HNSW（总纲 §4.1），hybrid 为 RRF 融合）。
+// AskService 问答编排（§6.2、§6.3；Ask 不得直接访问 pgvector/OpenSearch，只面向 Retriever 接口，建议⑥）。
 type AskService struct {
 	cfg        *config.Manager
+	repos      store.RepoStore
 	retrievers map[string]retriever.Retriever // key = mode：keyword|embedding|hybrid
 	llm        llm.LLM
 	logger     *zap.Logger
 }
 
-func NewAskService(cfg *config.Manager, retrievers map[string]retriever.Retriever, l llm.LLM, logger *zap.Logger) *AskService {
-	return &AskService{cfg: cfg, retrievers: retrievers, llm: l, logger: logger}
+func NewAskService(cfg *config.Manager, repos store.RepoStore, retrievers map[string]retriever.Retriever, l llm.LLM, logger *zap.Logger) *AskService {
+	return &AskService{cfg: cfg, repos: repos, retrievers: retrievers, llm: l, logger: logger}
 }
 
 // Ask POST /api/v1/ask（§6.2）。
 func (s *AskService) Ask(ctx context.Context, req dto.AskRequest) (*dto.AskResponse, error) {
-	_ = model.CodeLLMUnavailable
-	// TODO: 实现非流式问答，要求：
-	// ① 仓库须 state=ready，否则 40902；② mode 缺省取 retriever.mode 配置，top_k 缺省取 retriever.top_k（1~30），
-	//    temperature 省略取 llm.temperature 且钳制 [0,2]；
-	// ③ 按 mode 选 Retriever.Search 取 hits（topK）；vector 路径先 Embed 查询向量再走 pgvector <=> 余弦距离
-	//    （SET LOCAL hnsw.ef_search 取 storage.vector.ef_search，默认 64）；
-	// ④ 组装 prompt：system 明确"只能依据给定片段作答，引用格式 [path:start-end]，禁止编造行号与文件路径，
-	//    片段不足时回答'未在仓库中找到相关代码'"（硬约束 #15）；
-	// ⑤ llm.Generate 生成回答；references 就是 Retriever 返回的 hits（禁止从 LLM 输出解析），
-	//    响应装配前逐一校验 chunk_id 存在（硬约束 #15）；
-	// ⑥ usage 来自 provider；缺失时按 tokens≈ceil(len([]rune(content))/4) 估算兜底（§12.4）；
-	// ⑦ 错误映射：LLM 不可用 → 50201；Embedding 不可用 → 50202；OpenSearch 不可用 → 50303 search_unavailable；
-	//    pgvector 查询失败 → 50203 vector_store_unavailable（总纲 §6 新增码）；mode 回显实际生效值。
-	panic("TODO: AskService.Ask not implemented")
+	start := time.Now()
+
+	mode, topK, temperature, err := s.normalizeAskParams(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureRepoReady(ctx, req.RepoID); err != nil {
+		return nil, err
+	}
+
+	hits, err := s.search(ctx, mode, req.RepoID, req.Question, topK)
+	if err != nil {
+		return nil, err
+	}
+	references := buildReferences(hits)
+
+	prompt := buildAskPrompt(req.Question, hits)
+	resp, err := s.llm.Generate(ctx, model.ChatRequest{
+		Model:       s.llm.ModelName(),
+		Messages:    prompt,
+		Temperature: temperature,
+		MaxTokens:   s.cfg.Get().LLM.MaxTokens,
+	})
+	if err != nil {
+		return nil, mapLLMError(err)
+	}
+
+	usage := usageFromResponse(resp)
+	return &dto.AskResponse{
+		Answer:     resp.Content,
+		References: references,
+		Mode:       mode,
+		Usage:      usage,
+		LatencyMs:  time.Since(start).Milliseconds(),
+	}, nil
 }
 
 // AskStream POST /api/v1/ask/stream 的业务实现（§6.3；sink 由 handler 提供，负责 SSE 帧写出）。
 func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink func(event string, payload any) error) error {
-	// TODO: 实现流式问答，要求：
-	// ① 事件顺序：references（恰好 1 个）→ token（0~N 个）→ done（恰好 1 个）；error 可出现在任意位置并终止流；
-	// ② 检索完成立即 sink("references", ...)；llm.GenerateStream 的每个 delta → sink("token", {delta})；
-	// ③ 结束 sink("done", {usage, latency_ms})；provider 不返回 usage 时估算兜底；
-	// ④ 客户端断开 → ctx 取消 → LLM 流中断、goroutine 退出，不补偿不重放（§6.3）；
-	// ⑤ 其余约束与错误映射同 Ask ③~⑦。
-	panic("TODO: AskService.AskStream not implemented")
+	start := time.Now()
+
+	mode, topK, temperature, err := s.normalizeAskParams(req)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureRepoReady(ctx, req.RepoID); err != nil {
+		return err
+	}
+
+	hits, err := s.search(ctx, mode, req.RepoID, req.Question, topK)
+	if err != nil {
+		return err
+	}
+	if err := sink("references", dto.StreamReferencesEvent{Mode: mode, References: buildReferences(hits)}); err != nil {
+		return err
+	}
+
+	prompt := buildAskPrompt(req.Question, hits)
+	stream, err := s.llm.GenerateStream(ctx, model.ChatRequest{
+		Model:       s.llm.ModelName(),
+		Messages:    prompt,
+		Temperature: temperature,
+		MaxTokens:   s.cfg.Get().LLM.MaxTokens,
+	})
+	if err != nil {
+		return mapLLMError(err)
+	}
+
+	var answer strings.Builder
+	var usage *model.Usage
+	for chunk := range stream {
+		if chunk.Err != nil {
+			return mapLLMError(chunk.Err)
+		}
+		if chunk.Delta != "" {
+			answer.WriteString(chunk.Delta)
+			if err := sink("token", dto.StreamTokenEvent{Delta: chunk.Delta}); err != nil {
+				return err
+			}
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+	}
+
+	u := usageFromStream(usage, answer.String())
+	return sink("done", dto.StreamDoneEvent{Usage: u, LatencyMs: time.Since(start).Milliseconds()})
+}
+
+func (s *AskService) normalizeAskParams(req dto.AskRequest) (mode string, topK int, temperature float64, err error) {
+	cfg := s.cfg.Get()
+	mode = req.Mode
+	if mode == "" {
+		mode = cfg.Retriever.Mode
+	}
+	if _, ok := s.retrievers[mode]; !ok {
+		return "", 0, 0, model.NewAPIError(model.CodeInvalidParam, "invalid mode")
+	}
+	topK = cfg.Retriever.TopK
+	if req.TopK != nil {
+		topK = *req.TopK
+	}
+	if topK < 1 {
+		topK = 1
+	}
+	if topK > 30 {
+		topK = 30
+	}
+	temperature = cfg.LLM.Temperature
+	if req.Temperature != nil {
+		temperature = *req.Temperature
+	}
+	if temperature < 0 {
+		temperature = 0
+	}
+	if temperature > 2 {
+		temperature = 2
+	}
+	return mode, topK, temperature, nil
+}
+
+func (s *AskService) ensureRepoReady(ctx context.Context, repoID string) error {
+	repo, err := s.repos.Get(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, model.ErrRepoNotFound) {
+			return model.ErrRepoNotFound
+		}
+		return err
+	}
+	if repo.State != "ready" {
+		return model.NewAPIError(model.CodeInvalidTaskState, "repo is not ready")
+	}
+	return nil
+}
+
+func (s *AskService) search(ctx context.Context, mode, repoID, query string, topK int) ([]model.ChunkHit, error) {
+	r, ok := s.retrievers[mode]
+	if !ok {
+		return nil, model.NewAPIError(model.CodeInvalidParam, "invalid mode")
+	}
+	hits, err := r.Search(ctx, repoID, query, topK)
+	if err != nil {
+		var apiErr *model.APIError
+		if errors.As(err, &apiErr) {
+			return nil, apiErr
+		}
+		if mode == "embedding" {
+			return nil, &model.APIError{Code: model.CodeVectorStoreUnavailable, Message: model.MessageOf(model.CodeVectorStoreUnavailable), Err: err}
+		}
+		return nil, &model.APIError{Code: model.CodeSearchUnavailable, Message: model.MessageOf(model.CodeSearchUnavailable), Err: err}
+	}
+	return hits, nil
+}
+
+func buildReferences(hits []model.ChunkHit) []dto.ReferenceDTO {
+	refs := make([]dto.ReferenceDTO, 0, len(hits))
+	for _, h := range hits {
+		refs = append(refs, dto.ReferenceDTO{
+			ChunkID:   h.Chunk.ChunkID,
+			Path:      h.Chunk.Path,
+			StartLine: h.Chunk.StartLine,
+			EndLine:   h.Chunk.EndLine,
+			Language:  h.Chunk.Language,
+			Score:     h.Score,
+			Snippet:   truncateRunes(h.Chunk.Content, 300),
+		})
+	}
+	return refs
+}
+
+func buildAskPrompt(question string, hits []model.ChunkHit) []model.ChatMessage {
+	system := `你是一个代码问答助手。你只能依据下面给出的代码片段回答问题。
+引用格式必须使用 [path:start-end]；禁止编造行号与文件路径。
+如果片段不足以回答，请回答“未在仓库中找到相关代码”。`
+
+	var ctx strings.Builder
+	for _, h := range hits {
+		ctx.WriteString(fmt.Sprintf("\n--- %s:%d-%d ---\n%s\n", h.Chunk.Path, h.Chunk.StartLine, h.Chunk.EndLine, h.Chunk.Content))
+	}
+
+	user := fmt.Sprintf("代码片段：%s\n\n问题：%s", ctx.String(), question)
+	return []model.ChatMessage{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}
+}
+
+func usageFromResponse(resp model.ChatResponse) dto.UsageDTO {
+	if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
+		return dto.UsageDTO{PromptTokens: resp.Usage.PromptTokens, CompletionTokens: resp.Usage.CompletionTokens}
+	}
+	return estimateUsage(resp.Content, "")
+}
+
+func usageFromStream(usage *model.Usage, answer string) dto.UsageDTO {
+	if usage != nil && (usage.PromptTokens > 0 || usage.CompletionTokens > 0) {
+		return dto.UsageDTO{PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens}
+	}
+	return estimateUsage(answer, "")
+}
+
+func estimateUsage(completion, prompt string) dto.UsageDTO {
+	return dto.UsageDTO{
+		PromptTokens:     (utf8.RuneCountInString(prompt) + 3) / 4,
+		CompletionTokens: (utf8.RuneCountInString(completion) + 3) / 4,
+	}
+}
+
+func mapLLMError(err error) error {
+	var apiErr *model.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	return &model.APIError{Code: model.CodeLLMUnavailable, Message: model.MessageOf(model.CodeLLMUnavailable), Err: err}
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }

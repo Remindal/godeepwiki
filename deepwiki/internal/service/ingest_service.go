@@ -3,7 +3,12 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json"
+	"regexp"
+	"time"
 
+	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
 
 	"deepwiki/internal/api/dto"
@@ -14,6 +19,8 @@ import (
 	"deepwiki/internal/store"
 	"deepwiki/internal/task"
 )
+
+var repoIDRegex = regexp.MustCompile(`^repo_[0-9A-HJKMNP-TV-Z]{26}$`)
 
 // IngestService 摄取与刷新编排。
 type IngestService struct {
@@ -29,28 +36,136 @@ func NewIngestService(tm task.TaskManager, repos store.RepoStore, cloner ingest.
 	return &IngestService{tm: tm, repos: repos, cloner: cloner, publisher: publisher, cfg: cfg, logger: logger}
 }
 
+func newID(prefix string) string {
+	return prefix + ulid.MustNew(ulid.Timestamp(time.Now().UTC()), ulid.Monotonic(rand.Reader, 0)).String()
+}
+
 // SubmitIngest POST /api/v1/ingest 的业务实现（§6.1）。
 func (s *IngestService) SubmitIngest(ctx context.Context, req dto.IngestRequest) (*model.Task, *model.Repo, error) {
-	// TODO: 实现摄取提交，要求：
-	// ① s.publisher.QueueDepth 背压预检：≥ x-max-length（worker.queue_size，默认 100）→ 直接返回
-	//    model.ErrQueueFull（42902），避免白做 LsRemote（总纲 §4.3 背压契约）；
-	// ② cloner.LsRemote 取远端 HEAD commit（git ls-remote，失败放行并记 WARN，§6.1）；
-	// ③ 与 repos.GetByURLBranch 比对：commit 未变 → 40901（details 附 existing_repo_id）；
-	//    commit 已变 → 40901（details.issue=use_refresh）；
-	// ④ 生成 repo_id（"repo_"+ULID）与 task_id（"tsk_"+ULID），Repo 预创建 state=ingesting；
-	// ⑤ Task{Type:ingest, State:pending, RequestPayload: 原始请求快照} 经 tm.Submit 提交
-	//    （内部：Postgres 落 pending → RabbitMQ 瘦消息 confirm 投递；confirm 失败 → 50302）；
-	// ⑥ options 缺省值取 ingest.* 配置（请求 options 覆盖配置，§6.1 校验规则表）。
-	panic("TODO: IngestService.SubmitIngest not implemented")
+	cfg := s.cfg.Get()
+
+	// ① RabbitMQ 背压预检：队列满直接 42902，避免白做 LsRemote。
+	if s.publisher != nil {
+		depth, err := s.publisher.QueueDepth(ctx)
+		if err != nil {
+			s.logger.Warn("queue depth precheck failed", zap.Error(err))
+		} else if depth >= cfg.Worker.QueueSize {
+			return nil, nil, model.ErrQueueFull
+		}
+	}
+
+	// ② 远端 HEAD commit（失败放行并记 WARN，不阻断提交）。
+	commitHash := ""
+	if s.cloner != nil {
+		if h, err := s.cloner.LsRemote(ctx, req.RepoURL, req.Branch); err != nil {
+			s.logger.Warn("git ls-remote failed", zap.String("repo_url", req.RepoURL), zap.String("branch", req.Branch), zap.Error(err))
+		} else {
+			commitHash = h
+		}
+	}
+
+	// ③ 幂等判断：同 repo_url+branch 已存在时按 commit 是否变化区分提示。
+	existing, err := s.repos.GetByURLBranch(ctx, req.RepoURL, req.Branch)
+	if err == nil && existing != nil {
+		if commitHash != "" && existing.CommitHash == commitHash {
+			apiErr := model.NewAPIError(model.CodeRepoAlreadyExists, model.MessageOf(model.CodeRepoAlreadyExists))
+			apiErr.Details = []model.ErrorDetail{{Field: "repo_url", Issue: "repository already ingested", ExistingRepoID: existing.RepoID}}
+			return nil, nil, apiErr
+		}
+		apiErr := model.NewAPIError(model.CodeRepoAlreadyExists, model.MessageOf(model.CodeRepoAlreadyExists))
+		apiErr.Details = []model.ErrorDetail{{Field: "repo_url", Issue: "use_refresh", ExistingRepoID: existing.RepoID}}
+		return nil, nil, apiErr
+	}
+	if err != nil && err != model.ErrRepoNotFound {
+		return nil, nil, err
+	}
+
+	// ④ 预创建 repo（state=ingesting）。
+	repo := &model.Repo{
+		RepoID:     newID("repo_"),
+		RepoURL:    req.RepoURL,
+		Branch:     req.Branch,
+		CommitHash: commitHash,
+		State:      "ingesting",
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+	if err := s.repos.Create(ctx, repo); err != nil {
+		return nil, nil, err
+	}
+
+	// ⑤ 原始请求快照作为 RequestPayload。
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	t := &model.Task{
+		TaskID:         newID("tsk_"),
+		Type:           model.TaskTypeIngest,
+		RepoID:         repo.RepoID,
+		State:          model.TaskStatePending,
+		RequestPayload: payload,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := s.tm.Submit(ctx, t); err != nil {
+		// 提交失败回滚 repo，避免残留 ingesting 状态。
+		if delErr := s.repos.Delete(ctx, repo.RepoID); delErr != nil {
+			s.logger.Error("rollback repo failed", zap.String("repo_id", repo.RepoID), zap.Error(delErr))
+		}
+		return nil, nil, err
+	}
+
+	return t, repo, nil
 }
 
 // SubmitRefresh POST /api/v1/repos/{repo_id}/refresh 的业务实现（§4.7、§6.7）。
 func (s *IngestService) SubmitRefresh(ctx context.Context, repoID string) (*model.Task, error) {
-	// TODO: 实现刷新提交，要求：
-	// ① repoID 先过 ULID 正则（硬约束 #11）；② 仓库不存在 → 40402；非 ready 或有进行中任务冲突 → 40902；
-	// ③ 同仓 refresh 互斥经 Redis 分布式锁 lock:refresh:<repo_id>（SET NX PX 300000，总纲 R13；
-	//    多 worker 节点下 v1 原方案的进程内去重机制已失效，必须分布式互斥；持锁失败 → 40902）；
-	// ④ 构造 Task{Type:refresh} 经 tm.Submit 提交（Pipeline：fetching→diffing→chunking→embedding→persisting；
-	//    git CLI fetch --depth 1 + reset --hard FETCH_HEAD + clean -fdx，禁止 git pull，硬约束 #5）。
-	panic("TODO: IngestService.SubmitRefresh not implemented")
+	if !repoIDRegex.MatchString(repoID) {
+		return nil, model.NewAPIError(model.CodeInvalidParam, "invalid repo_id format")
+	}
+
+	repo, err := s.repos.Get(ctx, repoID)
+	if err != nil {
+		if err == model.ErrRepoNotFound {
+			return nil, model.ErrRepoNotFound
+		}
+		return nil, err
+	}
+	if repo.State != "ready" {
+		return nil, model.NewAPIError(model.CodeInvalidTaskState, "repo is not ready")
+	}
+
+	// 进行中任务冲突检查（ingest/refresh/wiki 任一非终态即拒绝）。
+	tasks, _, err := s.tm.List(ctx, model.TaskFilter{RepoID: repoID, Page: 1, PageSize: 100})
+	if err == nil {
+		for _, t := range tasks {
+			if !t.State.IsTerminal() {
+				return nil, model.NewAPIError(model.CodeInvalidTaskState, "repo has running task")
+			}
+		}
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"repo_id":  repo.RepoID,
+		"repo_url": repo.RepoURL,
+		"branch":   repo.Branch,
+	})
+	if err != nil {
+		return nil, err
+	}
+	t := &model.Task{
+		TaskID:         newID("tsk_"),
+		Type:           model.TaskTypeRefresh,
+		RepoID:         repo.RepoID,
+		State:          model.TaskStatePending,
+		RequestPayload: payload,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := s.tm.Submit(ctx, t); err != nil {
+		if err == model.ErrRepoAlreadyExists { // Manager refresh 锁冲突 → 40902
+			return nil, model.NewAPIError(model.CodeInvalidTaskState, "refresh already in progress")
+		}
+		return nil, err
+	}
+	return t, nil
 }

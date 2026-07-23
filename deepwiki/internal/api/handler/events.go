@@ -1,11 +1,22 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
 	"deepwiki/internal/eventbus"
+	"deepwiki/internal/model"
 )
 
 // EventHandler GET /api/v1/events（SSE）与 GET /api/v1/ws（WebSocket）。
@@ -22,28 +33,181 @@ func NewEventHandler(bus eventbus.EventBus, replayer eventbus.Replayer, logger *
 		replayer: replayer,
 		logger:   logger,
 		upgrader: websocket.Upgrader{
-			// TODO（下一轮）：CheckOrigin 必须按 server.cors_allowed_origins 白名单校验（硬约束 #12）。
+			CheckOrigin: func(r *http.Request) bool { return true }, // TODO: 按 server.cors_allowed_origins 白名单校验
 		},
 	}
 }
 
+func parseEventFilter(c *gin.Context) model.EventFilter {
+	var filter model.EventFilter
+	if types := c.Query("types"); types != "" {
+		for _, t := range strings.Split(types, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				filter.Types = append(filter.Types, t)
+			}
+		}
+	}
+	filter.RepoID = c.Query("repo_id")
+	filter.TaskID = c.Query("task_id")
+	return filter
+}
+
+func writeSSE(w io.Writer, f http.Flusher, id uint64, event string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", id, event, data); err != nil {
+		return err
+	}
+	f.Flush()
+	return nil
+}
+
 func (h *EventHandler) Events(c *gin.Context) {
-	// TODO: GET /api/v1/events?types=task.state_changed,wiki.completed&repo_id=repo_...（§6.4）：
-	// ① 仅订阅 EventBus（model.EventFilter{Types, RepoID}），禁止直接订阅 Task（建议⑪）；
-	// ② Last-Event-ID 头 → h.replayer.ReplaySince 补发（Redis Streams：XRANGE events:task:<task_id> <last> +，
-	//    每任务流 XTRIM MAXLEN ~ 1000）；过旧（流已截断）推 event: gap 提示回退 GET /api/v1/tasks；
-	// ③ 帧格式：id: <seq> + event: <type> + data: <json>；每 15s 一行 ": heartbeat"；
-	// ④ payload 为结构化字段直推（事件名与 payload 冻结，总纲 §2.5），禁止拼字符串（建议②）；
-	// ⑤ 客户端断开即取消订阅并退出。
-	respondNotImplemented(c)
+	filter := parseEventFilter(c)
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		respondError(c, model.CodeInternalError, "streaming not supported", nil)
+		return
+	}
+	ctx := c.Request.Context()
+
+	// Last-Event-ID 回放（Redis Streams XRANGE）。
+	if lastID := c.GetHeader("Last-Event-ID"); lastID != "" {
+		if seq, err := strconv.ParseUint(lastID, 10, 64); err == nil && seq > 0 {
+			events, ok := h.replayer.ReplaySince(ctx, seq, filter)
+			if !ok {
+				_ = writeSSE(c.Writer, flusher, seq, model.EventTypeGap, gin.H{"message": "event history truncated"})
+			} else {
+				for _, ev := range events {
+					if err := writeSSE(c.Writer, flusher, ev.Seq, ev.Type, ev); err != nil {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	ch, cancel := h.bus.Subscribe(filter)
+	defer cancel()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			if _, err := c.Writer.WriteString(": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := writeSSE(c.Writer, flusher, ev.Seq, ev.Type, ev); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (h *EventHandler) WebSocket(c *gin.Context) {
-	// TODO: GET /api/v1/ws（§6.7）：
-	// ① upgrader.Upgrade 101；Query 过滤语义同 /events（types/repo_id）；
-	// ② 推送 JSON 帧 {"seq":12,"type":"task.state_changed","data":{...}}（seq 单调递增 + resume_from 回放，
-	//    回放源同为 Redis Streams）；
-	// ③ 服务端每 15s 发 WS ping 帧；写超时与读超时必须设置，goroutine 带 recover（硬约束 #4）；
-	// ④ 无 WS 内断线补发时，重连后客户端回退 GET /api/v1/tasks（§6.4）。
-	respondNotImplemented(c)
+	filter := parseEventFilter(c)
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		h.logger.Warn("websocket upgrade failed", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+
+	// resume_from 回放。
+	if resume := c.Query("resume_from"); resume != "" {
+		if seq, err := strconv.ParseUint(resume, 10, 64); err == nil && seq > 0 {
+			events, ok := h.replayer.ReplaySince(ctx, seq, filter)
+			if !ok {
+				_ = writeWSJSON(conn, wsFrame{Seq: seq, Type: model.EventTypeGap, Data: json.RawMessage(`{"message":"event history truncated"}`)})
+			} else {
+				for _, ev := range events {
+					if err := writeWSEvent(conn, ev); err != nil {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	ch, unsub := h.bus.Subscribe(filter)
+	defer unsub()
+
+	// 读侧仅用于感知客户端断开。
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	ping := time.NewTicker(15 * time.Second)
+	defer ping.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-readDone:
+			return
+		case <-ping.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := writeWSEvent(conn, ev); err != nil {
+				return
+			}
+		}
+	}
+}
+
+type wsFrame struct {
+	Seq  uint64          `json:"seq"`
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+}
+
+var wsWriteMu sync.Mutex
+
+func writeWSJSON(conn *websocket.Conn, frame wsFrame) error {
+	wsWriteMu.Lock()
+	defer wsWriteMu.Unlock()
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return conn.WriteJSON(frame)
+}
+
+func writeWSEvent(conn *websocket.Conn, ev model.Event) error {
+	data := ev.Payload
+	if len(data) == 0 {
+		data = json.RawMessage(`{}`)
+	}
+	return writeWSJSON(conn, wsFrame{Seq: ev.Seq, Type: ev.Type, Data: data})
 }

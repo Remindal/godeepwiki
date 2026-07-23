@@ -136,9 +136,6 @@ func main() {
 	tm := task.NewManager(taskStore, bus, publisher, cfg.Worker, logger).
 		WithLocker(lock.New(rdb, logger)).
 		WithMaxRetries(cfg.Queue.RabbitMQ.MaxRetries)
-	// ingest/refresh/wiki 三个 Executor 在各自模块迭代落地后注册（tm.RegisterExecutor(...)）；
-	// 未注册类型的任务被消费时落 failed/50001，不会阻塞其他类型。
-	tm.Start(ctx, consumer)
 
 	// ⑫ git 可用性探测（git --version；缺失 → health degraded，总纲 §4.6）。
 	gitVersion, gitOK := probeGit(ctx, cfg.Git.BinaryPath)
@@ -167,8 +164,19 @@ func main() {
 
 	ingestSvc := service.NewIngestService(tm, repoStore, cloner, publisher, cm, logger)
 	repoSvc := service.NewRepoService(repoStore, chunkStore, vectorStore, wikiStore, searchCli, tm, logger)
-	askSvc := service.NewAskService(cm, retrievers, llmClient, logger)
-	wikiSvc := service.NewWikiService(tm, wikiStore, logger)
+	askSvc := service.NewAskService(cm, repoStore, retrievers, llmClient, logger)
+	wikiSvc := service.NewWikiService(tm, repoStore, wikiStore, logger)
+
+	// 注册三类任务执行器后再启动消费（总纲 §4.3：CAS 抢占 → 路由 Executor）。
+	onAutoWiki := func(ctx context.Context, repoID string) {
+		if _, err := wikiSvc.Generate(ctx, repoID); err != nil {
+			logger.Warn("auto wiki generate failed", zap.String("repo_id", repoID), zap.Error(err))
+		}
+	}
+	tm.RegisterExecutor(service.NewIngestExecutor(taskStore, repoStore, cloner, emb, chunkStore, bus, cm, onAutoWiki, logger))
+	tm.RegisterExecutor(service.NewRefreshExecutor(taskStore, repoStore, cloner, emb, chunkStore, bus, cm, logger))
+	tm.RegisterExecutor(service.NewWikiExecutor(taskStore, repoStore, wikiStore, retrievers, llmClient, cm, bus, logger))
+	tm.Start(ctx, consumer)
 
 	ready := &atomic.Bool{}
 	ready.Store(true)

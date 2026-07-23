@@ -1,9 +1,15 @@
 package handler
 
 import (
+	"errors"
+	"net/http"
+	"strconv"
+
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"deepwiki/internal/api/dto"
+	"deepwiki/internal/model"
 	"deepwiki/internal/task"
 )
 
@@ -18,20 +24,99 @@ func NewTaskHandler(tm task.TaskManager, logger *zap.Logger) *TaskHandler {
 }
 
 func (h *TaskHandler) List(c *gin.Context) {
-	// TODO: GET /api/v1/tasks（§6.7）：?type=&state=&repo_id=&page=&page_size= 过滤分页；
-	// items 为 Task 全字段投影（不含 cancel_flag/request_payload，model.Task json tag 已保证）+ pagination。
-	respondNotImplemented(c)
+	var filter model.TaskFilter
+	if t := c.Query("type"); t != "" {
+		tt := model.TaskType(t)
+		filter.Type = &tt
+	}
+	if s := c.Query("state"); s != "" {
+		ss := model.TaskState(s)
+		filter.State = &ss
+	}
+	filter.RepoID = c.Query("repo_id")
+	filter.Page, _ = strconv.Atoi(c.DefaultQuery("page", "1"))
+	filter.PageSize, _ = strconv.Atoi(c.DefaultQuery("page_size", "20"))
+
+	tasks, total, err := h.tm.List(c.Request.Context(), filter)
+	if err != nil {
+		h.logger.Error("list tasks failed", zap.Error(err))
+		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)
+		return
+	}
+
+	page := filter.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := filter.PageSize
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	totalPages := (total + int64(pageSize) - 1) / int64(pageSize)
+	respondOK(c, dto.PageResult[*model.Task]{
+		Items: tasks,
+		Pagination: dto.Pagination{
+			Page:       page,
+			PageSize:   pageSize,
+			Total:      total,
+			TotalPages: totalPages,
+		},
+	})
 }
 
 func (h *TaskHandler) Get(c *gin.Context) {
-	// TODO: GET /api/v1/tasks/{task_id}：task_id 先过 ^tsk_[0-9A-HJKMNP-TV-Z]{26}$ 正则；未命中 40401。
-	// 对应题目 GET /api/ingest/:id/status 的映射端点（路径以本契约为准，总纲 §2.11）。
-	respondNotImplemented(c)
+	taskID := c.Param("task_id")
+	if !validTaskID(taskID) {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), invalidTaskIDDetail("task_id"))
+		return
+	}
+	t, err := h.tm.Get(c.Request.Context(), taskID)
+	if err != nil {
+		h.handleTaskError(c, err)
+		return
+	}
+	respondOK(c, t)
 }
 
 func (h *TaskHandler) Cancel(c *gin.Context) {
-	// TODO: DELETE /api/v1/tasks/{task_id}（§4.5）：ULID 正则校验；
-	// 成功 202 + 当前 task 快照（state 可能尚未变 cancelled）；终态 → 40902；
-	// model.ErrTaskNotFound → 40401；model.ErrInvalidTaskState → 40902。
-	respondNotImplemented(c)
+	taskID := c.Param("task_id")
+	if !validTaskID(taskID) {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), invalidTaskIDDetail("task_id"))
+		return
+	}
+	if err := h.tm.Cancel(c.Request.Context(), taskID); err != nil {
+		h.handleTaskError(c, err)
+		return
+	}
+	t, err := h.tm.Get(c.Request.Context(), taskID)
+	if err != nil {
+		h.handleTaskError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, model.Envelope{
+		Code:      0,
+		Message:   "ok",
+		Data:      t,
+		RequestID: requestID(c),
+	})
+}
+
+func (h *TaskHandler) handleTaskError(c *gin.Context, err error) {
+	var apiErr *model.APIError
+	if errors.As(err, &apiErr) {
+		respondError(c, apiErr.Code, apiErr.Message, apiErr.Details)
+		return
+	}
+	switch {
+	case errors.Is(err, model.ErrTaskNotFound):
+		respondError(c, model.CodeTaskNotFound, model.MessageOf(model.CodeTaskNotFound), nil)
+	case errors.Is(err, model.ErrInvalidTaskState):
+		respondError(c, model.CodeInvalidTaskState, model.MessageOf(model.CodeInvalidTaskState), nil)
+	default:
+		h.logger.Error("task operation failed", zap.Error(err))
+		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)
+	}
 }

@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -13,24 +15,52 @@ import (
 // WikiService Wiki 编排（与 ingest 共用同一套任务系统，建议⑩）。
 type WikiService struct {
 	tm     task.TaskManager
+	repos  store.RepoStore
 	wikis  store.WikiStore
 	logger *zap.Logger
 }
 
-func NewWikiService(tm task.TaskManager, wikis store.WikiStore, logger *zap.Logger) *WikiService {
-	return &WikiService{tm: tm, wikis: wikis, logger: logger}
+func NewWikiService(tm task.TaskManager, repos store.RepoStore, wikis store.WikiStore, logger *zap.Logger) *WikiService {
+	return &WikiService{tm: tm, repos: repos, wikis: wikis, logger: logger}
 }
 
 // Generate POST /api/v1/wiki/generate（§6.7）：返回 202 + task_id；已有 wiki 则覆盖重建。
 func (s *WikiService) Generate(ctx context.Context, repoID string) (*model.Task, error) {
-	// TODO: ① repoID ULID 正则校验；仓库须 ready，否则 40902；② 构造 Task{Type:wiki, State:pending} 经 tm.Submit 提交
-	// （wiki 状态机 pending→outlining→generating→completed，§4.3；L2 配额走 wiki_per_hour=10，总纲 §2.8）；
-	// ③ auto_wiki=true 的 ingest 进入 completed 后由 TaskManager 自动调用本方法（§4.3 级联联动）。
-	panic("TODO: WikiService.Generate not implemented")
+	if !repoIDRegex.MatchString(repoID) {
+		return nil, model.NewAPIError(model.CodeInvalidParam, "invalid repo_id format")
+	}
+	repo, err := s.repos.Get(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, model.ErrRepoNotFound) {
+			return nil, model.ErrRepoNotFound
+		}
+		return nil, err
+	}
+	if repo.State != "ready" {
+		return nil, model.NewAPIError(model.CodeInvalidTaskState, "repo is not ready")
+	}
+
+	t := &model.Task{
+		TaskID:    newID("tsk_"),
+		Type:      model.TaskTypeWiki,
+		RepoID:    repo.RepoID,
+		State:     model.TaskStatePending,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.tm.Submit(ctx, t); err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // GetWiki GET /api/v1/repos/{repo_id}/wiki（§6.7）：未生成 → 40403。
 func (s *WikiService) GetWiki(ctx context.Context, repoID string) (*store.Wiki, error) {
-	// TODO: 委托 wikis.Get；model.ErrWikiNotFound → 40403。
-	panic("TODO: WikiService.GetWiki not implemented")
+	if !repoIDRegex.MatchString(repoID) {
+		return nil, model.NewAPIError(model.CodeInvalidParam, "invalid repo_id format")
+	}
+	w, err := s.wikis.Get(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
 }

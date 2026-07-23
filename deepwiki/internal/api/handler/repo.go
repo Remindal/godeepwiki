@@ -1,9 +1,16 @@
 package handler
 
 import (
+	"errors"
+	"net/http"
+	"strconv"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"deepwiki/internal/api/dto"
+	"deepwiki/internal/model"
 	"deepwiki/internal/service"
 )
 
@@ -19,27 +26,124 @@ func NewRepoHandler(repos *service.RepoService, ingest *service.IngestService, l
 }
 
 func (h *RepoHandler) List(c *gin.Context) {
-	// TODO: GET /api/v1/repos（§6.7）：page/page_size 解析（§5.4 默认 1/20、page_size 钳制 1~100）；
-	// 响应 dto.PageResult[Repo 摘要]；items 字段：repo_id, repo_url, branch, commit_hash, state, stats, created_at, updated_at。
-	respondNotImplemented(c)
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+
+	repos, total, err := h.repos.ListRepos(c.Request.Context(), page, pageSize)
+	if err != nil {
+		h.logger.Error("list repos failed", zap.Error(err))
+		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)
+		return
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	totalPages := (total + int64(pageSize) - 1) / int64(pageSize)
+	respondOK(c, dto.PageResult[*model.Repo]{
+		Items: repos,
+		Pagination: dto.Pagination{
+			Page:       page,
+			PageSize:   pageSize,
+			Total:      total,
+			TotalPages: totalPages,
+		},
+	})
 }
 
 func (h *RepoHandler) Get(c *gin.Context) {
-	// TODO: GET /api/v1/repos/{repo_id}（§6.7）：repo_id 先过 ^repo_[0-9A-HJKMNP-TV-Z]{26}$ 正则（硬约束 #11）；
-	// 详情 = 列表字段 + latest_task + wiki_available + chunk_count；未命中 40402。
-	respondNotImplemented(c)
+	repoID := c.Param("repo_id")
+	if !validRepoID(repoID) {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), invalidRepoIDDetail("repo_id"))
+		return
+	}
+	detail, err := h.repos.GetRepo(c.Request.Context(), repoID)
+	if err != nil {
+		h.handleRepoError(c, err)
+		return
+	}
+	respondOK(c, detail)
 }
 
 func (h *RepoHandler) Delete(c *gin.Context) {
-	// TODO: DELETE /api/v1/repos/{repo_id}（§6.7、§12.3）：ULID 正则校验；
-	// 响应 {repo_id, deleted:{chunks, vectors, wiki_pages, opensearch_docs, local_dir:true}}
-	//（关键词索引文档数字段随 OpenSearch 平移更名，语义不变）；任务历史保留（repo_id 置 NULL）。
-	respondNotImplemented(c)
+	repoID := c.Param("repo_id")
+	if !validRepoID(repoID) {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), invalidRepoIDDetail("repo_id"))
+		return
+	}
+	res, err := h.repos.DeleteRepo(c.Request.Context(), repoID)
+	if err != nil {
+		h.handleRepoError(c, err)
+		return
+	}
+	respondOK(c, gin.H{
+		"repo_id": repoID,
+		"deleted": res,
+	})
 }
 
 func (h *RepoHandler) Refresh(c *gin.Context) {
-	// TODO: POST /api/v1/repos/{repo_id}/refresh（§6.7）：无 body；202 同 ingest 的 data 结构（type=refresh）；
-	// 仓库非 ready / 进行中任务冲突 → 40902；同仓互斥锁 lock:refresh:<repo_id> 持锁失败 → 40902；
-	// 限流桶 L1 per-IP + L2 ingest_per_hour。
-	respondNotImplemented(c)
+	repoID := c.Param("repo_id")
+	if !validRepoID(repoID) {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), invalidRepoIDDetail("repo_id"))
+		return
+	}
+	t, err := h.ingest.SubmitRefresh(c.Request.Context(), repoID)
+	if err != nil {
+		h.handleSubmitError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, model.Envelope{
+		Code:    0,
+		Message: "ok",
+		Data: dto.TaskSubmittedResponse{
+			TaskID:        t.TaskID,
+			RepoID:        t.RepoID,
+			Type:          string(t.Type),
+			State:         string(t.State),
+			QueuePosition: t.QueuePosition,
+			CreatedAt:     t.CreatedAt.UTC().Format(time.RFC3339),
+		},
+		RequestID: requestID(c),
+	})
 }
+
+func (h *RepoHandler) handleRepoError(c *gin.Context, err error) {
+	var apiErr *model.APIError
+	if errors.As(err, &apiErr) {
+		respondError(c, apiErr.Code, apiErr.Message, apiErr.Details)
+		return
+	}
+	switch {
+	case errors.Is(err, model.ErrRepoNotFound):
+		respondError(c, model.CodeRepoNotFound, model.MessageOf(model.CodeRepoNotFound), nil)
+	default:
+		h.logger.Error("repo operation failed", zap.Error(err))
+		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)
+	}
+}
+
+func (h *RepoHandler) handleSubmitError(c *gin.Context, err error) {
+	var apiErr *model.APIError
+	if errors.As(err, &apiErr) {
+		respondError(c, apiErr.Code, apiErr.Message, apiErr.Details)
+		return
+	}
+	switch {
+	case errors.Is(err, model.ErrQueueFull):
+		c.Header("Retry-After", "60")
+		respondError(c, model.CodeQueueFull, model.MessageOf(model.CodeQueueFull), nil)
+	case errors.Is(err, model.ErrQueueUnavailable):
+		respondError(c, model.CodeQueueUnavailable, model.MessageOf(model.CodeQueueUnavailable), nil)
+	default:
+		h.logger.Error("refresh submit failed", zap.Error(err))
+		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)
+	}
+}
+
+func requestID(c *gin.Context) string { return c.GetString("request_id") }
