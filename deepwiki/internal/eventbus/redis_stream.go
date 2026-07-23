@@ -1,5 +1,6 @@
 // Package eventbus 基于 Redis Streams 的事件总线。
-// 统一事件形态 model.Event（总纲 §4.3），用于领域事件广播、跨节点扇出、任务状态同步。
+// 物理载体为每任务一条流 events:task:<task_id>（XTRIM MAXLEN ~ 1000），
+// 跨节点扇出经 Pub/Sub 频道 events:fanout（总纲 §4.4）。
 package eventbus
 
 import (
@@ -7,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,12 +20,13 @@ import (
 )
 
 const (
-	streamName    = "deepwiki:events"
-	fanoutPrefix  = "deepwiki:events:fanout:"
+	streamPrefix  = "events:task:"
 	fanoutChannel = "events:fanout"
+	streamMaxLen  = 1000
+	subBuffer     = 256
 )
 
-// RedisStreamsBus Redis Streams 实现，带本节点顺序序列号与跨节点扇出。
+// RedisStreamsBus Redis Streams 实现：每任务一条事件日志流 + Pub/Sub 跨节点扇出。
 type RedisStreamsBus struct {
 	rdb    redis.UniversalClient
 	seq    atomic.Uint64
@@ -38,15 +41,24 @@ type subscriber struct {
 	ch      chan model.Event
 	cancel  context.CancelFunc
 	filter  model.EventFilter
-	onEvent func(model.Event)
+	lastSeq atomic.Uint64
 }
 
-// NewRedisStreamsBus 创建 Redis Streams 总线。
+// NewRedisStreamsBus 创建 Redis Streams 总线；本地 seq 以 UnixMilli 初始化，避免重启后与历史事件撞号。
 func NewRedisStreamsBus(rdb redis.UniversalClient, logger *zap.Logger) *RedisStreamsBus {
-	return &RedisStreamsBus{rdb: rdb, subs: make(map[int]*subscriber), logger: logger}
+	b := &RedisStreamsBus{rdb: rdb, subs: make(map[int]*subscriber), logger: logger}
+	b.seq.Store(uint64(time.Now().UnixMilli()))
+	return b
 }
 
-// Publish 发布事件到 deepwiki:events Stream，并顺带写入扇出频道。
+func streamNameForTask(taskID string) string {
+	if taskID == "" {
+		return streamPrefix + "global"
+	}
+	return streamPrefix + taskID
+}
+
+// Publish 发布事件到 events:task:<task_id> Stream，并写入扇出频道。
 func (b *RedisStreamsBus) Publish(ctx context.Context, ev model.Event) error {
 	if ev.Seq == 0 {
 		ev.Seq = b.nextSeq()
@@ -58,15 +70,28 @@ func (b *RedisStreamsBus) Publish(ctx context.Context, ev model.Event) error {
 	if err != nil {
 		return fmt.Errorf("eventbus publish marshal: %w", err)
 	}
+
+	stream := streamNameForTask(ev.TaskID)
+	id := fmt.Sprintf("%d-0", ev.Seq)
 	args := redis.XAddArgs{
-		Stream: streamName,
-		Values: map[string]any{"data": string(payload)},
+		Stream: stream,
+		ID:     id,
+		Values: map[string]any{
+			"seq":  ev.Seq,
+			"type": ev.Type,
+			"data": string(payload),
+		},
 	}
 	if _, err := b.rdb.XAdd(ctx, &args).Result(); err != nil {
 		return fmt.Errorf("eventbus xadd: %w", err)
 	}
-	if err := b.rdb.Publish(ctx, fanoutChannel, payload).Err(); err != nil {
-		b.logger.Warn("eventbus fanout publish failed", zap.Error(err))
+	if err := b.rdb.XTrimMaxLenApprox(ctx, stream, streamMaxLen, 0).Err(); err != nil {
+		b.logger.Warn("eventbus xtrim failed", zap.String("stream", stream), zap.Error(err))
+	}
+	if ev.TaskID != "" {
+		if err := b.rdb.Publish(ctx, fanoutChannel, ev.TaskID).Err(); err != nil {
+			b.logger.Warn("eventbus fanout publish failed", zap.Error(err))
+		}
 	}
 	return nil
 }
@@ -76,17 +101,19 @@ func (b *RedisStreamsBus) nextSeq() uint64 {
 }
 
 // Subscribe 订阅事件总线；返回过滤后的事件通道与取消函数。
+// 新订阅者从当前 seq 起订阅，不回放历史；断线回放由 Replayer.ReplaySince 承担。
 func (b *RedisStreamsBus) Subscribe(filter model.EventFilter) (<-chan model.Event, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan model.Event, 256)
+	ch := make(chan model.Event, subBuffer)
 	sub := &subscriber{id: b.nextID, ch: ch, cancel: cancel, filter: filter}
+	sub.lastSeq.Store(b.seq.Load())
+
 	b.mu.Lock()
 	sub.id = b.nextID
 	b.nextID++
 	b.subs[sub.id] = sub
 	b.mu.Unlock()
 
-	// 本地广播分发 goroutine（由 Publish 触发，占位）。
 	go func() {
 		<-ctx.Done()
 		b.remove(sub.id)
@@ -94,60 +121,49 @@ func (b *RedisStreamsBus) Subscribe(filter model.EventFilter) (<-chan model.Even
 	return ch, func() { cancel() }
 }
 
-// ReplaySince 重放 seq > lastSeq 且匹配 filter 的事件；无法补发时返回 ok=false。
+// ReplaySince 重放 seq > lastSeq 且匹配 filter 的事件；lastSeq 过旧（流已截断）无法补发时返回 ok=false。
 func (b *RedisStreamsBus) ReplaySince(ctx context.Context, lastSeq uint64, filter model.EventFilter) ([]model.Event, bool) {
+	if filter.TaskID == "" {
+		return nil, false
+	}
+	stream := streamNameForTask(filter.TaskID)
 	start := fmt.Sprintf("%d-0", lastSeq)
+	msgs, err := b.rdb.XRangeN(ctx, stream, start, "+", streamMaxLen).Result()
+	if err != nil {
+		b.logger.Warn("eventbus replay xrange", zap.String("stream", stream), zap.Error(err))
+		return nil, false
+	}
+
 	var events []model.Event
-	for {
-		msgs, err := b.rdb.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{streamName, start},
-			Count:   100,
-			Block:   100 * time.Millisecond,
-		}).Result()
-		if err == redis.Nil {
-			select {
-			case <-ctx.Done():
-				return events, false
-			default:
-				continue
-			}
+	var firstSeq uint64
+	for _, m := range msgs {
+		seq, _ := parseStreamSeq(m.ID)
+		if seq <= lastSeq {
+			continue
 		}
-		if err != nil {
-			b.logger.Warn("eventbus replay xread", zap.Error(err))
-			return events, false
+		if firstSeq == 0 {
+			firstSeq = seq
 		}
-		gotNew := false
-		for _, stream := range msgs {
-			for _, msg := range stream.Messages {
-				start = msg.ID
-				raw, _ := msg.Values["data"].(string)
-				var ev model.Event
-				if err := json.Unmarshal([]byte(raw), &ev); err != nil {
-					b.logger.Warn("eventbus replay unmarshal", zap.Error(err))
-					continue
-				}
-				if ev.Seq <= lastSeq {
-					continue
-				}
-				gotNew = true
-				if matchFilter(ev, filter) {
-					events = append(events, ev)
-				}
-			}
+		raw, _ := m.Values["data"].(string)
+		var ev model.Event
+		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			b.logger.Warn("eventbus replay unmarshal", zap.Error(err))
+			continue
 		}
-		if !gotNew {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return events, false
-		default:
+		if matchFilter(ev, filter) {
+			events = append(events, ev)
 		}
 	}
-	return events, true
+
+	// 若 lastSeq 非 0 且第一条返回事件的 seq 跳过 lastSeq+1，说明中间事件已被 XTRIM 截断。
+	gap := lastSeq > 0 && firstSeq > 0 && firstSeq > lastSeq+1
+	return events, !gap
 }
 
 func matchFilter(ev model.Event, filter model.EventFilter) bool {
+	if filter.TaskID != "" && ev.TaskID != filter.TaskID {
+		return false
+	}
 	if filter.RepoID != "" && ev.RepoID != filter.RepoID {
 		return false
 	}
@@ -184,8 +200,11 @@ func (b *RedisStreamsBus) Close() error {
 	return nil
 }
 
-// parseSeqID 从 "millis-seq" 解析时间戳。
-func parseSeqID(id string) time.Time {
-	millis, _ := strconv.ParseInt(id, 10, 64)
-	return time.UnixMilli(millis)
+// parseStreamSeq 从 Redis Stream ID "seq-0" 解析 seq。
+func parseStreamSeq(id string) (uint64, error) {
+	parts := strings.SplitN(id, "-", 2)
+	if len(parts) == 0 {
+		return 0, fmt.Errorf("invalid stream id %q", id)
+	}
+	return strconv.ParseUint(parts[0], 10, 64)
 }

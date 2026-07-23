@@ -53,16 +53,34 @@ func (l *redisLimiter) Allow(ctx context.Context, key string, window time.Durati
 	l.degraded.Store(false)
 	arr, ok := res.([]any)
 	if !ok || len(arr) != 2 {
+		l.degraded.Store(true)
 		return l.fallback.allow(key, window, limit), nil
 	}
 	allowed, _ := arr[0].(int64)
 	remaining, _ := arr[1].(int64)
-	return Decision{
+	d := Decision{
 		Allowed:   allowed == 1,
 		Limit:     limit,
 		Remaining: int(remaining),
 		ResetUnix: now.Add(window).Unix(),
-	}, nil
+	}
+	if !d.Allowed {
+		d.RetryAfter = l.retryAfter(ctx, key, nowMs, window)
+	}
+	return d, nil
+}
+
+// retryAfter 估算最早一个窗口内请求过期所需时间（用于 Retry-After 头）。
+func (l *redisLimiter) retryAfter(ctx context.Context, key string, nowMs int64, window time.Duration) time.Duration {
+	oldest, err := l.rdb.ZRangeWithScores(ctx, key, 0, 0).Result()
+	if err != nil || len(oldest) == 0 {
+		return window
+	}
+	ms := int64(oldest[0].Score) + window.Milliseconds() - nowMs
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func (l *redisLimiter) Degraded() bool { return l.degraded.Load() }

@@ -26,7 +26,9 @@ type Event struct {
 }
 
 // EventFilter 订阅过滤；空 = 全部。
+// TaskID 用于 SSE/WS 断线回放（Last-Event-ID → XRANGE events:task:<task_id>）。
 type EventFilter struct {
 	Types  []string
 	RepoID string
+	TaskID string
 }
