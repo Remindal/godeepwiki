@@ -2,6 +2,9 @@ package queue
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
@@ -15,24 +18,64 @@ type Consumer struct {
 	conn     *Conn
 	prefetch int
 	logger   *zap.Logger
-	// TODO（下一轮）：消费 channel、consumer tag（Channel.Cancel 停拉新消息用）。
+	mu       sync.Mutex
+	ch       *amqp.Channel
+	tag      string
 }
 
 func NewConsumer(conn *Conn, prefetch int, logger *zap.Logger) *Consumer {
+	if prefetch <= 0 {
+		prefetch = 2
+	}
 	return &Consumer{conn: conn, prefetch: prefetch, logger: logger}
 }
 
 // Deliveries 启动消费并返回消息通道（autoAck=false，禁止自动确认，硬约束 #18）。
 func (c *Consumer) Deliveries(ctx context.Context) (<-chan amqp.Delivery, error) {
-	// TODO: 实现消费，要求：
-	// ① 独立 channel → Qos(prefetch=c.prefetch, 0, false)（prefetch = pool_size，与 Worker Pool 容量一致）；
-	// ② Consume(QueueJobs, consumerTag, autoAck=false, exclusive=false, ...) 返回 <-chan amqp.Delivery；
-	// ③ ctx 取消或 Stop 调用 → Channel.Cancel(consumerTag) 停拉新消息（不丢弃在途消息）。
-	panic("TODO: Consumer.Deliveries not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ch, err := c.conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("consumer channel: %w", err)
+	}
+	if err := ch.Qos(c.prefetch, 0, false); err != nil {
+		_ = ch.Close()
+		return nil, fmt.Errorf("consumer qos: %w", err)
+	}
+
+	c.tag = fmt.Sprintf("deepwiki-worker-%d", time.Now().UnixNano())
+	deliveries, err := ch.Consume(QueueJobs, c.tag, false, false, false, false, nil)
+	if err != nil {
+		_ = ch.Close()
+		return nil, fmt.Errorf("consumer consume: %w", err)
+	}
+	c.ch = ch
+
+	// ctx 取消或 Stop 调用时停止拉取新消息；在途消息 channel 保持打开以允许 ack/nack。
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.Stop(context.Background())
+		}
+	}()
+
+	return deliveries, nil
 }
 
 // Stop 停拉新消息（优雅退出第一步，硬约束 #10）；在途消息由 Worker Pool 排空或 nack requeue=true。
 func (c *Consumer) Stop(ctx context.Context) error {
-	// TODO: Channel.Cancel(consumerTag)；幂等。
+	c.mu.Lock()
+	ch := c.ch
+	tag := c.tag
+	c.tag = ""
+	c.mu.Unlock()
+
+	if ch == nil || tag == "" {
+		return nil
+	}
+	if err := ch.Cancel(tag, false); err != nil {
+		return fmt.Errorf("consumer cancel: %w", err)
+	}
 	return nil
 }

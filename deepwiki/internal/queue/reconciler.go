@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -24,9 +25,9 @@ type RecoveryStore interface {
 // 幂等 CAS 保证多节点并发恢复安全（硬约束 #18）；worker 崩溃后 Reconciler 从 DB 重建队列视图，
 // 消息系统挂一分钟任务一个都不丢（总纲 §10 答辩话术 1）。
 type Reconciler struct {
-	store RecoveryStore
-	pub   Publisher
-	logger *zap.Logger
+	store      RecoveryStore
+	pub        Publisher
+	logger     *zap.Logger
 	staleAfter time.Duration // 默认 5min
 }
 
@@ -36,6 +37,33 @@ func NewReconciler(store RecoveryStore, pub Publisher, logger *zap.Logger) *Reco
 
 // Recover 执行一次启动恢复（main 在 worker pool 启动前调用）。
 func (r *Reconciler) Recover(ctx context.Context) error {
-	// TODO: 实现启动恢复（骨架阶段先返回 nil，保证启动路径能走到 listening）。
+	reset, err := r.store.ResetStaleRunning(ctx, time.Now().UTC().Add(-r.staleAfter))
+	if err != nil {
+		return fmt.Errorf("reconciler reset stale running: %w", err)
+	}
+
+	tasks, err := r.store.FindInterrupted(ctx)
+	if err != nil {
+		return fmt.Errorf("reconciler find interrupted: %w", err)
+	}
+
+	republished := 0
+	for _, t := range tasks {
+		msg := TaskMessage{TaskID: t.TaskID, Type: string(t.Type)}
+		if err := r.pub.Publish(ctx, msg); err != nil {
+			r.logger.Error("reconciler republish failed",
+				zap.String("task_id", t.TaskID),
+				zap.Error(err),
+			)
+			continue
+		}
+		republished++
+	}
+
+	r.logger.Info("reconciler recovered",
+		zap.Int64("reset_stale", reset),
+		zap.Int("republished", republished),
+		zap.Int("interrupted", len(tasks)),
+	)
 	return nil
 }

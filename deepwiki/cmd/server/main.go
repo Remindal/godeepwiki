@@ -26,6 +26,7 @@ import (
 	"deepwiki/internal/eventbus"
 	"deepwiki/internal/ingest"
 	"deepwiki/internal/llm"
+	"deepwiki/internal/lock"
 	"deepwiki/internal/model"
 	"deepwiki/internal/observability"
 	"deepwiki/internal/queue"
@@ -132,7 +133,9 @@ func main() {
 	// ⑪ 统一任务系统：事件总线（Redis Streams + Pub/Sub 扇出）+ 消费端 + 有界 Worker Pool。
 	bus := eventbus.NewRedisStreamsBus(rdb, logger)
 	go bus.StartFanout(ctx)
-	tm := task.NewManager(taskStore, bus, publisher, cfg.Worker, logger)
+	tm := task.NewManager(taskStore, bus, publisher, cfg.Worker, logger).
+		WithLocker(lock.New(rdb, logger)).
+		WithMaxRetries(cfg.Queue.RabbitMQ.MaxRetries)
 	// ingest/refresh/wiki 三个 Executor 在各自模块迭代落地后注册（tm.RegisterExecutor(...)）；
 	// 未注册类型的任务被消费时落 failed/50001，不会阻塞其他类型。
 	tm.Start(ctx, consumer)
