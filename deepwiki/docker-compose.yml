@@ -29,6 +29,8 @@ services:
       OPENSEARCH_INITIAL_ADMIN_PASSWORD: "Deepwiki@123"  # OpenSearch 2.12+ 启动要求（开发态占位）
       bootstrap.memory_lock: "true"
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
     volumes:
       - osdata:/usr/share/opensearch/data
     ulimits:

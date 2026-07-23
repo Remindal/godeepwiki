@@ -26,6 +26,7 @@ import (
 	"deepwiki/internal/eventbus"
 	"deepwiki/internal/ingest"
 	"deepwiki/internal/llm"
+	"deepwiki/internal/model"
 	"deepwiki/internal/observability"
 	"deepwiki/internal/queue"
 	"deepwiki/internal/ratelimit"
@@ -93,7 +94,7 @@ func main() {
 	}
 	chunkStore := store.NewChunkStore(db, logger)
 	repoStore := store.NewRepoStore(db, logger)
-	go verifyIndices(ctx, repoStore, chunkStore, searchCli, logger)
+	go verifyIndices(ctx, repoStore, chunkStore, searchCli, pool, logger)
 
 	// ⑧ Redis 哨兵 FailoverClient（总纲 §4.4；地址与密码仅环境变量/引导层注入）。
 	rdb := redis.NewFailoverClient(&redis.FailoverOptions{
@@ -237,7 +238,7 @@ func main() {
 	if err := searchCli.Close(); err != nil { // ③ opensearch
 		logger.Error("close opensearch error", zap.Error(err))
 	}
-	db.Close() // ④ postgres
+	db.Close()                              // ④ postgres
 	if err := etcdSrc.Close(); err != nil { // ⑤ etcd
 		logger.Error("close etcd error", zap.Error(err))
 	}
@@ -409,8 +410,8 @@ func buildRetrievers(searchCli *search.Client, chunks store.ChunkStore, vectors 
 }
 
 // verifyIndices 启动一致性校验（总纲 §4.2）：每仓 count(index) == chunks 表行数，
-// 不一致 → WARN 并后台重建该仓索引。store 方法签名以 §5.6 为准。
-func verifyIndices(ctx context.Context, repos store.RepoStore, chunks store.ChunkStore, searchCli *search.Client, logger *zap.Logger) {
+// 不一致 → WARN 并后台重建该仓索引（本函数在独立 goroutine 中运行，重建随校验内联完成）。
+func verifyIndices(ctx context.Context, repos store.RepoStore, chunks store.ChunkStore, searchCli *search.Client, pool *pgxpool.Pool, logger *zap.Logger) {
 	defer func() { // 校验失败不得拖垮启动（硬约束 #4）
 		if r := recover(); r != nil {
 			logger.Error("verify indices panic", zap.Any("panic", r))
@@ -433,12 +434,46 @@ func verifyIndices(ctx context.Context, repos store.RepoStore, chunks store.Chun
 			continue
 		}
 		if got != want {
-			logger.Warn("verify indices: mismatch, schedule rebuild",
+			logger.Warn("verify indices: mismatch, rebuilding",
 				zap.String("repo_id", repoID), zap.Int64("postgres", want), zap.Int64("opensearch", got))
-			// 下一轮：投递该仓索引重建任务（bulk 全量重写，幂等 _id=chunk_id）。
+			if err := rebuildIndex(ctx, pool, searchCli, repoID); err != nil {
+				logger.Error("verify indices: rebuild failed", zap.String("repo_id", repoID), zap.Error(err))
+				continue
+			}
+			logger.Info("verify indices: rebuilt", zap.String("repo_id", repoID), zap.Int64("docs", want))
 		}
 	}
 	logger.Info("opensearch indices verified", zap.Int("repos", len(repoIDs)))
+}
+
+// rebuildIndex 全量重建单仓索引：删索引 → 建索引 → 从 chunks 表读全量 → bulk 重写（幂等 _id=chunk_id）。
+func rebuildIndex(ctx context.Context, pool *pgxpool.Pool, searchCli *search.Client, repoID string) error {
+	rows, err := pool.Query(ctx, `
+		SELECT chunk_id, repo_id, path, start_line, end_line, language, content
+		FROM chunks WHERE repo_id = $1
+	`, repoID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var chunks []model.Chunk
+	for rows.Next() {
+		var c model.Chunk
+		if err := rows.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content); err != nil {
+			return err
+		}
+		chunks = append(chunks, c)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := searchCli.DeleteIndex(ctx, repoID); err != nil {
+		return err
+	}
+	if err := searchCli.CreateIndex(ctx, repoID); err != nil {
+		return err
+	}
+	return searchCli.BulkIndex(ctx, repoID, chunks)
 }
 
 // probeGit git CLI 可用性探测（git --version 解析版本号，总纲 §4.6；

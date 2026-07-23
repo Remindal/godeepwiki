@@ -2,8 +2,12 @@ package retriever
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
 
 	"deepwiki/internal/embed"
@@ -28,24 +32,76 @@ func NewVectorRetriever(pool *pgxpool.Pool, emb embed.Embedder, efSearch int, lo
 
 func (r *VectorRetriever) Mode() string { return "embedding" }
 
+// Search query 向量化后走 pgvector；embedding 失败映射 50202 embedding_unavailable。
 func (r *VectorRetriever) Search(ctx context.Context, repoID string, query string, topK int) ([]model.ChunkHit, error) {
-	// TODO: 实现 pgvector 检索，要求：
-	// ① repoID 必须先过 ULID 正则（硬约束 #11）；
-	// ② r.emb.Embed(ctx, []string{query}) 取第一条向量，失败映射 50202 embedding_unavailable；
-	// ③ 必须在事务内执行下列 SQL（SET LOCAL 仅事务内有效；efSearch 为整数配置值拼接，非用户输入），
-	//    变更总纲 §4.1 检索 SQL 全文：
-	//      SET LOCAL hnsw.ef_search = 64;
-	//      SELECT chunk_id, path, start_line, end_line, language, content,
-	//             1 - (embedding <=> $2) AS score
-	//      FROM chunks
-	//      WHERE repo_id = $1
-	//        AND ($3::text IS NULL OR path LIKE $3)   -- 按文件路径过滤（进阶要求）
-	//      ORDER BY embedding <=> $2
-	//      LIMIT $4;
-	//    $3 传 nil 表示不按路径过滤；
-	// ④ 查询向量绑定用 pgvector.NewVector(vec)；维度不符会被 vector(1536) 列类型直接拒绝（硬约束 #14 第二道防线）；
-	// ⑤ score 为余弦相似度 [0,1]；DB 查询失败映射 50203 vector_store_unavailable。
-	panic("TODO: VectorRetriever.Search not implemented")
+	vectors, err := r.emb.Embed(ctx, []string{query})
+	if err != nil {
+		return nil, &model.APIError{Code: model.CodeEmbeddingUnavailable, Message: model.MessageOf(model.CodeEmbeddingUnavailable), Err: err}
+	}
+	if len(vectors) == 0 {
+		return nil, &model.APIError{Code: model.CodeEmbeddingUnavailable, Message: model.MessageOf(model.CodeEmbeddingUnavailable), Err: fmt.Errorf("embedder returned no vector")}
+	}
+	return r.SearchByVector(ctx, repoID, vectors[0], topK, "")
+}
+
+// SearchByVector pgvector HNSW 余弦检索（变更总纲 §4.1 检索 SQL 唯一实现处）。
+// SET LOCAL 仅事务内有效；efSearch 为整数配置值拼接，非用户输入；pathFilter 非空时
+// 按路径前缀过滤（$3 传 nil 表示不过滤）。score 为余弦相似度 [0,1]。
+func (r *VectorRetriever) SearchByVector(ctx context.Context, repoID string, vector []float32, topK int, pathFilter string) ([]model.ChunkHit, error) {
+	if !repoIDRegex.MatchString(repoID) {
+		return nil, fmt.Errorf("invalid repo_id format: %q", repoID)
+	}
+	if len(vector) == 0 {
+		return nil, fmt.Errorf("empty query vector")
+	}
+	if topK <= 0 {
+		topK = 10
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", model.ErrVectorStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SET LOCAL hnsw.ef_search = "+strconv.Itoa(r.efSearch)); err != nil {
+		return nil, fmt.Errorf("%w: %v", model.ErrVectorStoreUnavailable, err)
+	}
+
+	var pathPattern any
+	if pathFilter != "" {
+		pathPattern = pathFilter + "%"
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT chunk_id, path, start_line, end_line, language, content,
+		       1 - (embedding <=> $2) AS score
+		FROM chunks
+		WHERE repo_id = $1
+		  AND ($3::text IS NULL OR path LIKE $3)
+		ORDER BY embedding <=> $2
+		LIMIT $4
+	`, repoID, pgvector.NewVector(vector), pathPattern, topK)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", model.ErrVectorStoreUnavailable, err)
+	}
+	defer rows.Close()
+
+	var hits []model.ChunkHit
+	for rows.Next() {
+		var h model.ChunkHit
+		if err := rows.Scan(&h.Chunk.ChunkID, &h.Chunk.Path, &h.Chunk.StartLine, &h.Chunk.EndLine, &h.Chunk.Language, &h.Chunk.Content, &h.Score); err != nil {
+			return nil, fmt.Errorf("%w: %v", model.ErrVectorStoreUnavailable, err)
+		}
+		h.Chunk.RepoID = repoID
+		hits = append(hits, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %v", model.ErrVectorStoreUnavailable, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", model.ErrVectorStoreUnavailable, err)
+	}
+	return hits, nil
 }
 
 var _ Retriever = (*VectorRetriever)(nil)
