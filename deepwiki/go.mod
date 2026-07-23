@@ -8,6 +8,8 @@ require (
 	github.com/go-playground/validator/v10 v10.22.1
 	github.com/golang-migrate/migrate/v4 v4.18.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/jackc/pgconn v1.14.3
+	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
 	github.com/jackc/pgx/v5 v5.7.1
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/ollama/ollama v0.11.4
@@ -63,8 +65,6 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/jackc/chunkreader/v2 v2.0.1 // indirect
-	github.com/jackc/pgconn v1.14.3 // indirect
-	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa // indirect
 	github.com/jackc/pgio v1.0.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgproto3/v2 v2.3.3 // indirect

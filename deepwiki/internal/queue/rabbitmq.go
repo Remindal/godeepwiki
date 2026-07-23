@@ -1,99 +1,131 @@
-// Package queue RabbitMQ 连接封装与拓扑声明。
-// 总纲 §4.5：统一 deepwiki.tasks exchange；主队列 deepwiki.task.jobs（x-max-length 默认 10k，
-// 可经 queueMaxLen 覆盖）；DLX → retry 队列 → 死信队列 deepwiki.task.dead.letters。
+// Package queue RabbitMQ 任务队列：连接管理、拓扑声明、瘦消息投递与消费（总纲 §4.3）。
+// 设计要点：RabbitMQ 只承担「任务投递与执行跨进程/跨节点」的传输职责，
+// 任务状态唯一来源 = Postgres tasks 表（硬约束 #3）；消息为瘦消息（硬约束 #16）。
 package queue
 
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"time"
 
-	"github.com/rabbitmq/amqp091-go"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 )
 
+// 拓扑常量（总纲 §4.3，逐字一致，禁止改名）。
 const (
+	// ExchangeTasks direct exchange：任务消息经路由键 deepwiki.task.jobs 进入主队列。
 	ExchangeTasks = "deepwiki.tasks"
-	QueueJobs     = "deepwiki.task.jobs"
-	QueueRetry    = "deepwiki.task.retry"
-	QueueDead     = "deepwiki.task.dead.letters"
-	RetryDelayMS  = 30000
+	// QueueJobs 主队列：x-max-length = worker.queue_size（默认 100，硬约束 #6），
+	// x-dead-letter-exchange = deepwiki.tasks.dlx（nack requeue=false 的消息进 DLX 重试链）。
+	QueueJobs = "deepwiki.task.jobs"
+	// ExchangeDLX 死信 exchange（direct）：重试队列与死信队列的汇聚点。
+	ExchangeDLX = "deepwiki.tasks.dlx"
+	// QueueDLQ 死信队列：重试耗尽（默认 3 次，queue.rabbitmq.max_retries）后的最终归宿；
+	// DLQ 消息由 Reconciler/运维巡检消费并落库 failed/50003。
+	QueueDLQ = "deepwiki.task.dlq"
+	// 重试队列 TTL 链：TTL 到期后经 DLX 回流主队列，实现延迟重试（最多 3 次）。
+	QueueRetry5s  = "deepwiki.task.retry.5s"  // x-message-ttl=5000
+	QueueRetry30s = "deepwiki.task.retry.30s" // x-message-ttl=30000
+	QueueRetry5m  = "deepwiki.task.retry.5m"  // x-message-ttl=300000
+
+	// retryHeader 记录消息已历经的重试次数（消费失败重投时 +1）。
+	retryHeader = "x-retry-count"
 )
 
-// TaskMessage 投递到任务队列的瘦消息。
+var retryQueues = []struct {
+	name string
+	ttl  int64
+}{
+	{QueueRetry5s, 5000},
+	{QueueRetry30s, 30000},
+	{QueueRetry5m, 300000},
+}
+
+// TaskMessage 瘦消息协议（硬约束 #16：body ≤ 4KB，只携带 task_id+type；
+// 禁止把任务状态/进度/请求大对象塞进消息——状态唯一来源 = Postgres tasks 表，硬约束 #3）。
 type TaskMessage struct {
-	TaskID   string `json:"task_id"`
-	RepoID   string `json:"repo_id"`
-	Action   string `json:"action"`
-	Priority int    `json:"priority"`
+	TaskID string `json:"task_id"` // tsk_ + ULID(26)
+	Type   string `json:"type"`    // ingest|refresh|wiki
 }
 
-// Conn RabbitMQ 连接封装。
+// Conn RabbitMQ 连接封装（拓扑声明、通道工厂、优雅关闭）。
 type Conn struct {
-	conn        *amqp091.Connection
-	queueMaxLen int
+	conn        *amqp.Connection
 	logger      *zap.Logger
+	queueMaxLen int // x-max-length = worker.queue_size（默认 100）
 }
 
-// Dial 建立 RabbitMQ 连接。
+// Dial 建立 RabbitMQ 连接（url 仅由环境变量 DEEPWIKI_RABBITMQ_URL 注入，禁止 yaml 明文，硬约束 #2）。
 func Dial(ctx context.Context, url string, queueMaxLen int, logger *zap.Logger) (*Conn, error) {
-	conn, err := amqp091.Dial(url)
+	if url == "" {
+		return nil, fmt.Errorf("rabbitmq url is empty")
+	}
+	conn, err := amqp.Dial(url)
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq dial: %w", err)
 	}
 	return &Conn{conn: conn, queueMaxLen: queueMaxLen, logger: logger}, nil
 }
 
-// Channel 获取新通道。
-func (c *Conn) Channel() (*amqp091.Channel, error) {
-	return c.conn.Channel()
-}
-
-// DeclareTopology 声明 exchange、主队列、DLX、retry 队列、死信队列及绑定关系。
+// DeclareTopology 声明全部拓扑（幂等，可重复调用；总纲 §4.3）：
+//  1. direct exchange deepwiki.tasks 与 deepwiki.tasks.dlx（durable=true）；
+//  2. 主队列 deepwiki.task.jobs：durable=true，args{x-max-length=c.queueMaxLen,
+//     x-dead-letter-exchange=deepwiki.tasks.dlx}，绑定路由键 deepwiki.task.jobs；
+//  3. 重试队列 deepwiki.task.retry.{5s,30s,5m}：durable=true，args{x-message-ttl=5000/30000/300000,
+//     x-dead-letter-exchange=deepwiki.tasks, x-dead-letter-routing-key=deepwiki.task.jobs}（TTL 到期回流主队列）；
+//  4. 死信队列 deepwiki.task.dlq：durable=true，绑定 deepwiki.tasks.dlx。
+//
+// 验收口径：RabbitMQ management（http://localhost:15672）可见 deepwiki.task.jobs 且 x-max-length=100。
 func (c *Conn) DeclareTopology(ctx context.Context) error {
 	ch, err := c.conn.Channel()
 	if err != nil {
-		return fmt.Errorf("rabbitmq channel: %w", err)
+		return fmt.Errorf("rabbitmq topology channel: %w", err)
 	}
 	defer ch.Close()
 
 	if err := ch.ExchangeDeclare(ExchangeTasks, "direct", true, false, false, false, nil); err != nil {
-		return fmt.Errorf("rabbitmq exchange declare: %w", err)
+		return fmt.Errorf("rabbitmq exchange declare %s: %w", ExchangeTasks, err)
+	}
+	if err := ch.ExchangeDeclare(ExchangeDLX, "direct", true, false, false, false, nil); err != nil {
+		return fmt.Errorf("rabbitmq exchange declare %s: %w", ExchangeDLX, err)
 	}
 
-	jobArgs := amqp091.Table{
-		"x-dead-letter-exchange":    ExchangeTasks,
-		"x-dead-letter-routing-key": QueueRetry,
-		"x-max-length":              int64(c.queueMaxLen),
-		"x-overflow":                "reject-publish",
+	jobArgs := amqp.Table{
+		"x-dead-letter-exchange": ExchangeDLX,
+		"x-max-length":           int64(c.queueMaxLen),
+		"x-overflow":             "reject-publish",
 	}
 	if _, err := ch.QueueDeclare(QueueJobs, true, false, false, false, jobArgs); err != nil {
-		return fmt.Errorf("rabbitmq queue declare jobs: %w", err)
+		return fmt.Errorf("rabbitmq queue declare %s: %w", QueueJobs, err)
 	}
 	if err := ch.QueueBind(QueueJobs, QueueJobs, ExchangeTasks, false, nil); err != nil {
-		return fmt.Errorf("rabbitmq queue bind jobs: %w", err)
+		return fmt.Errorf("rabbitmq queue bind %s: %w", QueueJobs, err)
 	}
 
-	retryArgs := amqp091.Table{
-		"x-dead-letter-exchange":    ExchangeTasks,
-		"x-dead-letter-routing-key": QueueDead,
-		"x-message-ttl":             int64(RetryDelayMS),
-		"x-max-length":              int64(c.queueMaxLen),
-	}
-	if _, err := ch.QueueDeclare(QueueRetry, true, false, false, false, retryArgs); err != nil {
-		return fmt.Errorf("rabbitmq queue declare retry: %w", err)
-	}
-	if err := ch.QueueBind(QueueRetry, QueueRetry, ExchangeTasks, false, nil); err != nil {
-		return fmt.Errorf("rabbitmq queue bind retry: %w", err)
+	for _, rq := range retryQueues {
+		retryArgs := amqp.Table{
+			"x-message-ttl":             rq.ttl,
+			"x-dead-letter-exchange":    ExchangeTasks,
+			"x-dead-letter-routing-key": QueueJobs,
+			"x-max-length":              int64(c.queueMaxLen),
+		}
+		if _, err := ch.QueueDeclare(rq.name, true, false, false, false, retryArgs); err != nil {
+			return fmt.Errorf("rabbitmq queue declare %s: %w", rq.name, err)
+		}
+		if err := ch.QueueBind(rq.name, rq.name, ExchangeDLX, false, nil); err != nil {
+			return fmt.Errorf("rabbitmq queue bind %s: %w", rq.name, err)
+		}
 	}
 
-	deadArgs := amqp091.Table{"x-max-length": int64(c.queueMaxLen)}
-	if _, err := ch.QueueDeclare(QueueDead, true, false, false, false, deadArgs); err != nil {
-		return fmt.Errorf("rabbitmq queue declare dead: %w", err)
+	if _, err := ch.QueueDeclare(QueueDLQ, true, false, false, false, nil); err != nil {
+		return fmt.Errorf("rabbitmq queue declare %s: %w", QueueDLQ, err)
 	}
-	if err := ch.QueueBind(QueueDead, QueueDead, ExchangeTasks, false, nil); err != nil {
-		return fmt.Errorf("rabbitmq queue bind dead: %w", err)
+	// DLQ 既收显式死信路由键，也兜底所有从主队列 nack requeue=false 过来的消息（其 routing key 仍为 QueueJobs）。
+	if err := ch.QueueBind(QueueDLQ, QueueDLQ, ExchangeDLX, false, nil); err != nil {
+		return fmt.Errorf("rabbitmq queue bind %s: %w", QueueDLQ, err)
+	}
+	if err := ch.QueueBind(QueueDLQ, QueueJobs, ExchangeDLX, false, nil); err != nil {
+		return fmt.Errorf("rabbitmq queue bind %s (catch-all): %w", QueueDLQ, err)
 	}
 
 	c.logger.Info("rabbitmq topology declared",
@@ -104,48 +136,18 @@ func (c *Conn) DeclareTopology(ctx context.Context) error {
 	return nil
 }
 
-// QueueMaxLen 返回主队列最大长度。
+// Channel 新建 channel（publisher/consumer 各自持独立 channel，禁止跨 goroutine 共享，amqp091-go 线程安全约束）。
+func (c *Conn) Channel() (*amqp.Channel, error) {
+	return c.conn.Channel()
+}
+
+// QueueMaxLen 主队列 x-max-length 配置值（背压预检阈值，Manager.Submit 用）。
 func (c *Conn) QueueMaxLen() int { return c.queueMaxLen }
 
-// Close 关闭连接。
+// Close 优雅关闭连接（硬约束 #10：在 consumer 停止、在途消息 nack 处理完毕后最后调用）。
 func (c *Conn) Close() error {
-	if c.conn != nil {
+	if c.conn != nil && !c.conn.IsClosed() {
 		return c.conn.Close()
 	}
 	return nil
 }
-
-// Publish 发布消息到任务队列。
-func (c *Conn) Publish(ctx context.Context, routingKey string, body []byte, headers amqp091.Table) error {
-	ch, err := c.conn.Channel()
-	if err != nil {
-		return fmt.Errorf("rabbitmq publish channel: %w", err)
-	}
-	defer ch.Close()
-	return ch.PublishWithContext(ctx, ExchangeTasks, routingKey, true, false, amqp091.Publishing{
-		ContentType:  "application/json",
-		Body:         body,
-		Headers:      headers,
-		DeliveryMode: amqp091.Persistent,
-	})
-}
-
-// EnsureConsumerTag 辅助函数：若 tag 为空则生成 worker tag。
-func EnsureConsumerTag(tag string) string {
-	if tag != "" {
-		return tag
-	}
-	return "deepwiki-worker-" + strconv.FormatInt(timeNow().UnixNano(), 10)
-}
-
-func timeNow() Time { return timeNowFunc() }
-
-type Time interface{ UnixNano() int64 }
-
-var timeNowFunc = func() Time { return timeNowReal{} }
-
-type timeNowReal struct{}
-
-func (timeNowReal) UnixNano() int64 { return timeNowUnixNano() }
-
-func timeNowUnixNano() int64 { return time.Now().UnixNano() }

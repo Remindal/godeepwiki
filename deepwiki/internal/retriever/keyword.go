@@ -2,6 +2,8 @@ package retriever
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 
 	"go.uber.org/zap"
 
@@ -9,6 +11,9 @@ import (
 	"deepwiki/internal/search"
 	"deepwiki/internal/store"
 )
+
+// repoIDRegex 校验 repo_id：前缀 + 26 位 Crockford Base32 ULID（硬约束 #11）。
+var repoIDRegex = regexp.MustCompile(`^repo_[0-9A-HJKMNP-TV-Z]{26}$`)
 
 // KeywordRetriever OpenSearch BM25 实现；每仓一索引 deepwiki-chunks-<repo_id 全小写>（OpenSearch
 // 索引名必须小写，repo_id 含大写 ULID，统一 strings.ToLower），文档 _id = chunk_id。
@@ -25,16 +30,52 @@ func NewKeywordRetriever(client *search.Client, chunkStore store.ChunkStore, log
 func (r *KeywordRetriever) Mode() string { return "keyword" }
 
 func (r *KeywordRetriever) Search(ctx context.Context, repoID string, query string, topK int) ([]model.ChunkHit, error) {
-	// TODO: 实现 OpenSearch BM25 检索，要求：
-	// ① repoID 必须先过 ULID 正则（硬约束 #11），索引名经 internal/search 导出的构造函数生成
-	//    （deepwiki-chunks-<repo_id 全小写>），禁止字符串拼接用户输入进查询体；
-	// ② 查询体：multi_match 于 content^2, path；filter: term repo_id（索引内天然隔离可省略，保留 filter 防御）；
-	//    BM25 默认排序（mapping 已声明 index.similarity.default.type=BM25）；
-	//    进阶 path_filter 用 prefix 查询匹配 path.raw；
-	// ③ 取 topK 命中，用 _id（chunk_id）经 chunkStore.GetByIDs 回填 Chunk；
-	// ④ 尊重 ctx：OpenSearch 请求必须带 ctx，每步检查 ctx.Err()（硬约束 #4）；
-	// ⑤ OpenSearch 不可用映射 50303 search_unavailable；score 为 BM25 分。
-	panic("TODO: KeywordRetriever.Search not implemented")
+	return r.SearchWithPath(ctx, repoID, query, topK, "")
+}
+
+// SearchWithPath 带路径前缀过滤的 BM25 检索（进阶 path_filter：prefix 查询 path.raw）。
+// OpenSearch 仅返回 _id/_score，Chunk 正文经 chunkStore.GetByIDs 回填；命中顺序与 BM25 排序一致。
+func (r *KeywordRetriever) SearchWithPath(ctx context.Context, repoID string, query string, topK int, pathFilter string) ([]model.ChunkHit, error) {
+	if !repoIDRegex.MatchString(repoID) {
+		return nil, fmt.Errorf("invalid repo_id format: %q", repoID)
+	}
+	if topK <= 0 {
+		topK = 10
+	}
+	hits, err := r.client.Search(ctx, repoID, query, topK, pathFilter)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", model.ErrSearchUnavailable, err)
+	}
+	if len(hits) == 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	ids := make([]string, len(hits))
+	for i, h := range hits {
+		ids[i] = h.ChunkID
+	}
+	chunks, err := r.chunkStore.GetByIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("backfill chunks: %w", err)
+	}
+	byID := make(map[string]*model.Chunk, len(chunks))
+	for _, c := range chunks {
+		byID[c.ChunkID] = c
+	}
+
+	out := make([]model.ChunkHit, 0, len(hits))
+	for _, h := range hits {
+		c, ok := byID[h.ChunkID]
+		if !ok {
+			r.logger.Warn("opensearch hit missing in postgres, skip", zap.String("chunk_id", h.ChunkID), zap.String("repo_id", repoID))
+			continue
+		}
+		out = append(out, model.ChunkHit{Chunk: *c, Score: h.Score})
+	}
+	return out, nil
 }
 
 var _ Retriever = (*KeywordRetriever)(nil)

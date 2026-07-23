@@ -1,10 +1,14 @@
 package handler
 
 import (
+	"io"
+
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"deepwiki/internal/api/dto"
 	"deepwiki/internal/config"
+	"deepwiki/internal/model"
 )
 
 // ConfigHandler GET/PUT /api/v1/config（§6.5，建议⑭）。
@@ -18,18 +22,39 @@ func NewConfigHandler(cm *config.Manager, logger *zap.Logger) *ConfigHandler {
 }
 
 func (h *ConfigHandler) GetConfig(c *gin.Context) {
-	// TODO: GET /api/v1/config：返回 dto.ConfigResponse{Version, Config: h.cm.Masked(), RestartRequired}；
-	// 密钥字段必须脱敏（config.MaskAPIKey 规则），Auth 节与基础设施凭据不出现（json:"-"，硬约束 #2）；
-	// etcd 不可用时读本地快照缓存，GET 路径不报错（总纲 §4.5）。
-	respondNotImplemented(c)
+	res := dto.ConfigResponse{
+		Version:         h.cm.Version(),
+		Config:          *h.cm.Masked(),
+		RestartRequired: []string{},
+	}
+	respondOK(c, res)
 }
 
 func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
-	// TODO: PUT /api/v1/config（路由层已挂 AdminOnly）：
-	// ① 读取 JSON Merge Patch 原文 → h.cm.Apply(ctx, patch, 脱敏后的 key 标识)；
-	// ② 校验失败 → 42201 + details 字段级明细（整体拒绝保持旧值，审计写 etcd /deepwiki/audit/<version>
-	//    result=rejected，硬约束 #9）；
-	// ③ 成功 → dto.ConfigUpdateResponse{version, applied, restart_required, warnings}（审计 result=applied）；
-	// ④ etcd 写路径不可用 → 503 + 50304 config_store_unavailable（总纲 §6 新增码）。
-	respondNotImplemented(c)
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		respondError(c, model.CodeInvalidParam, model.MessageOf(model.CodeInvalidParam), nil)
+		return
+	}
+	if len(body) == 0 {
+		respondError(c, model.CodeInvalidParam, "patch body is empty", nil)
+		return
+	}
+	// changedBy 取请求标识；生产环境可进一步从 auth key 取脱敏 ID。
+	changedBy := c.Request.RemoteAddr
+	result, err := h.cm.Apply(c.Request.Context(), body, changedBy)
+	if err != nil {
+		if apiErr, ok := err.(*model.APIError); ok {
+			respondError(c, apiErr.Code, apiErr.Message, apiErr.Details)
+			return
+		}
+		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)
+		return
+	}
+	respondOK(c, dto.ConfigUpdateResponse{
+		Version:         result.Version,
+		Applied:         result.Applied,
+		RestartRequired: result.RestartRequired,
+		Warnings:        result.Warnings,
+	})
 }

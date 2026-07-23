@@ -2,8 +2,13 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"sync"
+	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 )
 
@@ -24,23 +29,141 @@ type Publisher interface {
 	Close() error
 }
 
+// RetryPublisher 重试/死信投递扩展接口（消费失败路径用；不污染冻结的 Publisher 接口）。
+type RetryPublisher interface {
+	// PublishRetry 把消息投递到 ExchangeDLX 的指定重试队列（按 attempt 选择 5s/30s/5m）。
+	PublishRetry(ctx context.Context, msg TaskMessage, attempt int) error
+	// PublishToDLQ 把消息投递到死信队列（审计）。
+	PublishToDLQ(ctx context.Context, msg TaskMessage) error
+}
+
+var _ RetryPublisher = (*amqpPublisher)(nil)
+
+const publishTimeout = 5 * time.Second
+
 type amqpPublisher struct {
 	conn   *Conn
 	logger *zap.Logger
-	// TODO（下一轮）：confirm channel、NotifyConfirm/NotifyReturn 监听、序列化缓冲。
+	mu     sync.Mutex
+	ch     *amqp.Channel
+	closed bool
 }
 
 func NewPublisher(conn *Conn, logger *zap.Logger) Publisher {
 	return &amqpPublisher{conn: conn, logger: logger}
 }
 
+func (p *amqpPublisher) ensureChannel() (*amqp.Channel, error) {
+	if p.ch != nil && !p.ch.IsClosed() {
+		return p.ch, nil
+	}
+	ch, err := p.conn.Channel()
+	if err != nil {
+		return nil, err
+	}
+	if err := ch.Confirm(false); err != nil {
+		_ = ch.Close()
+		return nil, err
+	}
+	p.ch = ch
+	return ch, nil
+}
+
 func (p *amqpPublisher) Publish(ctx context.Context, msg TaskMessage) error {
-	// TODO: 实现投递，要求（总纲 §4.3，硬约束 #16）：
-	// ① json.Marshal(msg) 为 body（≤ 4KB，天然满足；DeliveryMode=Persistent 持久化，ContentType=application/json）；
-	// ② channel.PublishWithContext(ctx, ExchangeTasks, QueueJobs, mandatory=true, immediate=false, ...)；
-	// ③ 等待 confirm：ack → 指标 deepwiki_rabbitmq_publish_confirms_total{result="ok"}++；
-	//    nack/超时/return → result="fail"++ 并返回 ErrPublishFailed（由 Manager 落库 failed/50302）。
-	panic("TODO: amqpPublisher.Publish not implemented")
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal task message: %w", err)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return ErrPublishFailed
+	}
+	ch, err := p.ensureChannel()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrPublishFailed, err)
+	}
+
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+	returns := ch.NotifyReturn(make(chan amqp.Return, 1))
+
+	if err := ch.PublishWithContext(ctx, ExchangeTasks, QueueJobs, true, false, amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         body,
+		DeliveryMode: amqp.Persistent,
+	}); err != nil {
+		return fmt.Errorf("%w: publish: %v", ErrPublishFailed, err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
+
+	select {
+	case conf, ok := <-confirms:
+		if !ok {
+			return ErrPublishFailed
+		}
+		if conf.Ack {
+			return nil
+		}
+		return ErrPublishFailed
+	case ret := <-returns:
+		p.logger.Warn("rabbitmq message returned", zap.Uint16("replyCode", ret.ReplyCode), zap.String("replyText", ret.ReplyText))
+		return ErrPublishFailed
+	case <-ctx.Done():
+		return ErrPublishFailed
+	}
+}
+
+func (p *amqpPublisher) PublishRetry(ctx context.Context, msg TaskMessage, attempt int) error {
+	if attempt < 0 || attempt >= len(retryQueues) {
+		return p.PublishToDLQ(ctx, msg)
+	}
+	return p.publishTo(ctx, ExchangeDLX, retryQueues[attempt].name, msg, amqp.Table{retryHeader: int32(attempt + 1)})
+}
+
+func (p *amqpPublisher) PublishToDLQ(ctx context.Context, msg TaskMessage) error {
+	return p.publishTo(ctx, ExchangeDLX, QueueDLQ, msg, nil)
+}
+
+func (p *amqpPublisher) publishTo(ctx context.Context, exchange, routingKey string, msg TaskMessage, headers amqp.Table) error {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal task message: %w", err)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return ErrPublishFailed
+	}
+	ch, err := p.ensureChannel()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrPublishFailed, err)
+	}
+
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+	if err := ch.PublishWithContext(ctx, exchange, routingKey, false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         body,
+		DeliveryMode: amqp.Persistent,
+		Headers:      headers,
+	}); err != nil {
+		return fmt.Errorf("%w: publish: %v", ErrPublishFailed, err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
+	select {
+	case conf, ok := <-confirms:
+		if !ok || !conf.Ack {
+			return ErrPublishFailed
+		}
+		return nil
+	case <-ctx.Done():
+		return ErrPublishFailed
+	}
 }
 
 func (p *amqpPublisher) QueueDepth(ctx context.Context) (int, error) {
@@ -49,14 +172,31 @@ func (p *amqpPublisher) QueueDepth(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	defer ch.Close()
+
 	q, err := ch.QueueDeclarePassive(QueueJobs, true, false, false, false, nil)
 	if err != nil {
+		var amqpErr *amqp.Error
+		if errors.As(err, &amqpErr) && amqpErr.Code == 404 {
+			// 队列为声明失败：触发拓扑重声明并按 0 处理，避免健康检查因瞬时缺失而 500。
+			if topoErr := p.conn.DeclareTopology(ctx); topoErr != nil {
+				p.logger.Warn("rabbitmq topology redeclare failed", zap.Error(topoErr))
+			}
+			return 0, nil
+		}
 		return 0, err
 	}
 	return q.Messages, nil
 }
 
 func (p *amqpPublisher) Close() error {
-	// TODO: 关闭 channel（幂等）。
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	if p.ch != nil {
+		return p.ch.Close()
+	}
 	return nil
 }
