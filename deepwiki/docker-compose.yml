@@ -210,8 +210,8 @@ services:
       # 集群内服务名与环回必须绕过代理，否则 gRPC/etcd 经代理不可达，启动卡在 etcd LoadAll。
       - HTTP_PROXY=http://host.docker.internal:7897
       - HTTPS_PROXY=http://host.docker.internal:7897
-      - NO_PROXY=etcd,postgres,rabbitmq,opensearch,redis-master,redis-replica-1,redis-replica-2,redis-sentinel-1,redis-sentinel-2,redis-sentinel-3,localhost,127.0.0.1,host.docker.internal
-      - no_proxy=etcd,postgres,rabbitmq,opensearch,redis-master,redis-replica-1,redis-replica-2,redis-sentinel-1,redis-sentinel-2,redis-sentinel-3,localhost,127.0.0.1,host.docker.internal
+      - NO_PROXY=etcd,postgres,rabbitmq,opensearch,redis-master,redis-replica-1,redis-replica-2,redis-sentinel-1,redis-sentinel-2,redis-sentinel-3,localhost,127.0.0.1,host.docker.internal,api.siliconflow.cn
+      - no_proxy=etcd,postgres,rabbitmq,opensearch,redis-master,redis-replica-1,redis-replica-2,redis-sentinel-1,redis-sentinel-2,redis-sentinel-3,localhost,127.0.0.1,host.docker.internal,api.siliconflow.cn
 
 volumes:
   pgdata:

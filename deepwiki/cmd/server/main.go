@@ -303,6 +303,10 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 	}()
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	// provider（LLM/Embedding）经代理访问外网，冷启动首次 TLS 握手较慢，给更宽的超时；
+	// 仅作用于后台探测 goroutine，不会阻塞 health 请求路径。
+	providerCtx, providerCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer providerCancel()
 
 	degraded := false
 	snap := p.snapshot.Load()
@@ -379,14 +383,14 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 
 	// LLM / Embedding：reachabilityProber（Ping + gobreaker 状态）异步探测；
 	// 失败只记 WARN 不阻塞，结果写入快照（health 接口只读快照，毫秒级返回）。
-	if err := probeProviderErr(probeCtx, p.llmCli); err != nil {
+	if err := probeProviderErr(providerCtx, p.llmCli); err != nil {
 		snap.LLM.Reachable = false
 		p.logger.Warn("llm provider probe failed", zap.Error(err))
 	} else {
 		snap.LLM.Reachable = true
 	}
 	snap.LLM.Breaker = breakerStateOf(p.llmCli)
-	if err := probeProviderErr(probeCtx, p.emb); err != nil {
+	if err := probeProviderErr(providerCtx, p.emb); err != nil {
 		snap.Embedding.Reachable = false
 		p.logger.Warn("embedding provider probe failed", zap.Error(err))
 	} else {
