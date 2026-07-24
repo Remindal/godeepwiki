@@ -34,8 +34,8 @@ ingest:
   exclude_dirs: [.git, node_modules, vendor, dist, build, target]
 
 embedding:
-  provider: openai                    # openai|dashscope|siliconflow|ollama|voyage
-  model: text-embedding-3-small
+  provider: siliconflow                 # openai|dashscope|siliconflow|ollama|voyage
+  model: BAAI/bge-large-zh-v1.5
   api_key: ""                         # 禁止明文；仅 DEEPWIKI_EMBEDDING_API_KEY 注入
   base_url: ""
   batch_size: 64
@@ -66,7 +66,7 @@ storage:
     dsn: ""                           # 禁止 yaml 明文；仅 DEEPWIKI_POSTGRES_DSN 注入；restart_required
     max_conns: 10                     # pgxpool MaxConns；热更新
   vector:
-    dimensions: 1536                  # pgvector 列维度；建表定型 restart_required（改维度 = 新迁移 + 全量重建）
+    dimensions: 1024                  # pgvector 列维度；建表定型 restart_required（改维度 = 新迁移 + 全量重建）
     ef_search: 64                     # HNSW SET LOCAL hnsw.ef_search；热更新
 
 search:

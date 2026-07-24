@@ -19,6 +19,13 @@ func makeFloatSlice(n int, val float32) []float32 {
 	return s
 }
 
+// oneHot 生成 n 维 one-hot 向量（idx 位置为 val），余弦距离可区分方向。
+func oneHot(n, idx int, val float32) []float32 {
+	s := make([]float32, n)
+	s[idx] = val
+	return s
+}
+
 func hashKey(key, salt string) string {
 	h := sha256.Sum256([]byte(salt + key))
 	return hex.EncodeToString(h[:])
@@ -54,9 +61,9 @@ func TestStore(t *testing.T) {
 		        ('chk_01J2X9K7QZ0ABCDEFGHJKMNQ','repo_test','b.go',1,10,'go','func add(){}',$2),
 		        ('chk_01J2X9K7QZ0ABCDEFGHJKMNR','repo_test','c.go',1,10,'go','func mul(){}',$3)
 		 ON CONFLICT DO NOTHING`,
-		pgvector.NewVector(makeFloatSlice(1536, 1.0)),
-		pgvector.NewVector(makeFloatSlice(1536, 2.0)),
-		pgvector.NewVector(makeFloatSlice(1536, 3.0)),
+		pgvector.NewVector(oneHot(1024, 0, 1.0)),
+		pgvector.NewVector(oneHot(1024, 1, 1.0)),
+		pgvector.NewVector(oneHot(1024, 2, 1.0)),
 	)
 	if err != nil {
 		t.Fatal("insert chunks:", err)
@@ -67,7 +74,7 @@ func TestStore(t *testing.T) {
 	err = pool.QueryRow(ctx,
 		`SELECT chunk_id, 1-(embedding<=>$1) 
 		 FROM chunks WHERE repo_id='repo_test' ORDER BY embedding<=>$1 LIMIT 1`,
-		pgvector.NewVector(makeFloatSlice(1536, 1.0)),
+		pgvector.NewVector(oneHot(1024, 0, 1.0)),
 	).Scan(&chunkID, &score)
 	if err != nil || chunkID != "chk_01J2X9K7QZ0ABCDEFGHJKMNP" {
 		t.Fatalf("vector search wrong: got %s score=%.3f err=%v", chunkID, score, err)
@@ -96,7 +103,7 @@ func TestStore(t *testing.T) {
 	_, _ = pool.Exec(ctx,
 		`INSERT INTO chunks (chunk_id,repo_id,path,start_line,end_line,language,content,embedding)
 		 VALUES ('chk_cascade','repo_cascade','x.go',1,1,'go','x',$1)`,
-		pgvector.NewVector(makeFloatSlice(1536, 1.0)),
+		pgvector.NewVector(makeFloatSlice(1024, 1.0)),
 	)
 	_, _ = pool.Exec(ctx,
 		`INSERT INTO wiki_pages (repo_id,slug,kind,title,content_md,created_at,updated_at)

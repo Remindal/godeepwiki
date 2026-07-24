@@ -20,7 +20,7 @@ type VectorStore interface {
 	DeleteByRepo(ctx context.Context, repoID string) error
 }
 
-// pgVectorStore pgvector 实现：embedding vector(1536) 列 + HNSW 索引（变更总纲 §4.1）。
+// pgVectorStore pgvector 实现：embedding vector(1024) 列 + HNSW 索引（变更总纲 §4.1）。
 type pgVectorStore struct {
 	pool     *pgxpool.Pool
 	efSearch int // storage.vector.ef_search，默认 64（可热更新）

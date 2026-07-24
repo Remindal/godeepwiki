@@ -60,7 +60,7 @@ func TestVerifyIndicesRebuild(t *testing.T) {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM repos WHERE repo_id = $1`, repoID)
 		_ = osCli.DeleteIndex(context.Background(), repoID)
 	}()
-	vec := make([]float32, 1536)
+	vec := make([]float32, 1024)
 	vec[0] = 1.0
 	for i, id := range chunkIDs {
 		if _, err := pool.Exec(ctx, `

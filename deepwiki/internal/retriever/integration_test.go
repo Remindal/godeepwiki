@@ -77,9 +77,9 @@ func itSetup(t *testing.T) (context.Context, *pgxpool.Pool, *search.Client, stor
 		path, content, lang string
 		vec                 []float32
 	}{
-		{"router/group.go", "router group handles HTTP routing tree registration", "go", itVector(1536, 0, 1.0)},
-		{"router/engine.go", "engine dispatches requests to router middleware chain", "go", itVector1536(0, 0.9, 1, 0.1)},
-		{"docs/deploy.md", "deployment guide for production clusters", "markdown", itVector(1536, 2, 1.0)},
+		{"router/group.go", "router group handles HTTP routing tree registration", "go", itVector(1024, 0, 1.0)},
+		{"router/engine.go", "engine dispatches requests to router middleware chain", "go", itVector1024(0, 0.9, 1, 0.1)},
+		{"docs/deploy.md", "deployment guide for production clusters", "markdown", itVector(1024, 2, 1.0)},
 	}
 	for i, r := range rows {
 		if _, err := pool.Exec(ctx, `
@@ -107,16 +107,16 @@ func itSetup(t *testing.T) (context.Context, *pgxpool.Pool, *search.Client, stor
 	return ctx, pool, osCli, chunks
 }
 
-// itVector 1536 维 one-hot 向量（idx 位置为 val）。
+// itVector 1024 维 one-hot 向量（idx 位置为 val）。
 func itVector(dim, idx int, val float32) []float32 {
 	v := make([]float32, dim)
 	v[idx] = val
 	return v
 }
 
-// itVector1536 指定两个分量的 1536 维向量。
-func itVector1536(i1 int, v1 float32, i2 int, v2 float32) []float32 {
-	v := make([]float32, 1536)
+// itVector1024 指定两个分量的 1024 维向量。
+func itVector1024(i1 int, v1 float32, i2 int, v2 float32) []float32 {
+	v := make([]float32, 1024)
 	v[i1], v[i2] = v1, v2
 	return v
 }
@@ -172,7 +172,7 @@ func TestKeywordRetrieverIntegration(t *testing.T) {
 
 func TestVectorRetrieverIntegration(t *testing.T) {
 	ctx, pool, _, _ := itSetup(t)
-	r := NewVectorRetriever(pool, fakeEmbedder{vec: itVector(1536, 0, 1.0)}, 64, zap.NewNop())
+	r := NewVectorRetriever(pool, fakeEmbedder{vec: itVector(1024, 0, 1.0)}, 64, zap.NewNop())
 
 	hits, err := r.Search(ctx, itRepoID, "anything", 10)
 	if err != nil {
@@ -198,7 +198,7 @@ func TestVectorRetrieverIntegration(t *testing.T) {
 func TestHybridRetrieverIntegration(t *testing.T) {
 	ctx, pool, osCli, chunks := itSetup(t)
 	kw := NewKeywordRetriever(osCli, chunks, zap.NewNop())
-	vec := NewVectorRetriever(pool, fakeEmbedder{vec: itVector(1536, 0, 1.0)}, 64, zap.NewNop())
+	vec := NewVectorRetriever(pool, fakeEmbedder{vec: itVector(1024, 0, 1.0)}, 64, zap.NewNop())
 	r := NewHybridRetriever(kw, vec, 60, zap.NewNop())
 
 	hits, err := r.Search(ctx, itRepoID, "router", 10)
