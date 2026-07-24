@@ -313,7 +313,12 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 	snap.Postgres.Connected = pgOK
 	snap.Postgres.Pool.Total = stat.TotalConns()
 	snap.Postgres.Pool.Idle = stat.IdleConns()
-	if !pgOK {
+	if pgOK {
+		var version uint
+		if err := p.pool.QueryRow(probeCtx, `SELECT version FROM schema_migrations LIMIT 1`).Scan(&version); err == nil {
+			snap.Postgres.MigrationVersion = version
+		}
+	} else {
 		degraded = true
 	}
 
@@ -372,12 +377,23 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 		degraded = true
 	}
 
-	// LLM / Embedding：启动探测 + gobreaker 状态（下一轮 adapter 落地 reachabilityProber 后生效；
-	// 骨架阶段固定 reachable=false → degraded，验收标准允许）。
-	snap.LLM.Reachable = probeProvider(probeCtx, p.llmCli)
+	// LLM / Embedding：reachabilityProber（Ping + gobreaker 状态）异步探测；
+	// 失败只记 WARN 不阻塞，结果写入快照（health 接口只读快照，毫秒级返回）。
+	if err := probeProviderErr(probeCtx, p.llmCli); err != nil {
+		snap.LLM.Reachable = false
+		p.logger.Warn("llm provider probe failed", zap.Error(err))
+	} else {
+		snap.LLM.Reachable = true
+	}
 	snap.LLM.Breaker = breakerStateOf(p.llmCli)
-	snap.Embedding.Reachable = probeProvider(probeCtx, p.emb)
+	if err := probeProviderErr(probeCtx, p.emb); err != nil {
+		snap.Embedding.Reachable = false
+		p.logger.Warn("embedding provider probe failed", zap.Error(err))
+	} else {
+		snap.Embedding.Reachable = true
+	}
 	snap.Embedding.Breaker = breakerStateOf(p.emb)
+	snap.Embedding.Dimensions = p.emb.Dimensions()
 	if !snap.LLM.Reachable || !snap.Embedding.Reachable {
 		degraded = true
 	}
@@ -397,12 +413,12 @@ type reachabilityProber interface {
 	BreakerState() string // closed|open|half-open（gobreaker，总纲 R8）
 }
 
-func probeProvider(ctx context.Context, provider any) bool {
+func probeProviderErr(ctx context.Context, provider any) error {
 	pr, ok := provider.(reachabilityProber)
 	if !ok {
-		return false // 骨架阶段：未实现探测契约按不可达处理（degraded）
+		return fmt.Errorf("provider does not implement reachabilityProber")
 	}
-	return pr.Ping(ctx) == nil
+	return pr.Ping(ctx)
 }
 
 func breakerStateOf(provider any) string {
