@@ -27,14 +27,31 @@ type EventHandler struct {
 	logger   *zap.Logger
 }
 
-func NewEventHandler(bus eventbus.EventBus, replayer eventbus.Replayer, logger *zap.Logger) *EventHandler {
+func NewEventHandler(bus eventbus.EventBus, replayer eventbus.Replayer, allowedOrigins []string, logger *zap.Logger) *EventHandler {
 	return &EventHandler{
 		bus:      bus,
 		replayer: replayer,
 		logger:   logger,
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true }, // TODO: 按 server.cors_allowed_origins 白名单校验
+			CheckOrigin: wsOriginChecker(allowedOrigins),
 		},
+	}
+}
+
+// wsOriginChecker 按 server.cors_allowed_origins 白名单校验 WS Origin（硬约束 #12）。
+// 无 Origin 头（非浏览器客户端）放行；白名单为空（dev 未配置）放行。
+func wsOriginChecker(allowed []string) func(r *http.Request) bool {
+	whitelist := make(map[string]struct{}, len(allowed))
+	for _, o := range allowed {
+		whitelist[strings.ToLower(strings.TrimSpace(o))] = struct{}{}
+	}
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" || len(whitelist) == 0 {
+			return true
+		}
+		_, ok := whitelist[strings.ToLower(origin)]
+		return ok
 	}
 }
 

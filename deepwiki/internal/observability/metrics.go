@@ -109,3 +109,17 @@ func SetWorkerBusy(v float64) {
 		Default.WorkerBusy.Set(v)
 	}
 }
+
+// IncRabbitMQPublishConfirm publisher confirm 结果计数（result=ok|fail）。
+func IncRabbitMQPublishConfirm(result string) {
+	if Default != nil {
+		Default.RabbitMQPublishConfirms.WithLabelValues(result).Inc()
+	}
+}
+
+// IncRatelimitDegraded 限流降级进程内兜底计数。
+func IncRatelimitDegraded() {
+	if Default != nil {
+		Default.RatelimitDegraded.Inc()
+	}
+}

@@ -35,6 +35,34 @@ func NewReconciler(store RecoveryStore, pub Publisher, logger *zap.Logger) *Reco
 	return &Reconciler{store: store, pub: pub, logger: logger, staleAfter: 5 * time.Minute}
 }
 
+// StartPeriodic 周期恢复（main 以 goroutine 启动）：除启动恢复外，周期执行 Recover，
+// worker 崩溃后 running 僵死任务不等重启即可被重置重投（总纲 §4.3 / §10 答辩话术 1）。
+// interval 建议 1min（僵死判定 staleAfter=5min，周期远小于它即可）。
+func (r *Reconciler) StartPeriodic(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				r.logger.Error("reconciler periodic panic recovered", zap.Any("panic", rec))
+			}
+		}()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := r.Recover(ctx); err != nil {
+					r.logger.Error("reconciler periodic recover failed", zap.Error(err))
+				}
+			}
+		}
+	}()
+}
+
 // Recover 执行一次启动恢复（main 在 worker pool 启动前调用）。
 func (r *Reconciler) Recover(ctx context.Context) error {
 	reset, err := r.store.ResetStaleRunning(ctx, time.Now().UTC().Add(-r.staleAfter))

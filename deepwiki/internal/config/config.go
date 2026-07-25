@@ -28,6 +28,9 @@ type ServerConfig struct {
 	ReadTimeout        time.Duration `mapstructure:"read_timeout" yaml:"read_timeout" json:"read_timeout" validate:"min=1000000000"`
 	ShutdownTimeout    time.Duration `mapstructure:"shutdown_timeout" yaml:"shutdown_timeout" json:"shutdown_timeout" validate:"min=1000000000"`
 	CORSAllowedOrigins []string      `mapstructure:"cors_allowed_origins" yaml:"cors_allowed_origins" json:"cors_allowed_origins" validate:"min=1,dive,url"` // 校验禁止 "*"
+	// TrustedProxies 可信反向代理 CIDR 列表（gin.SetTrustedProxies；空 = 不信任任何代理，
+	// per-IP 限流取 RemoteAddr，忽略 X-Forwarded-For，§9.1）。
+	TrustedProxies []string `mapstructure:"trusted_proxies" yaml:"trusted_proxies" json:"trusted_proxies"`
 }
 
 // AuthConfig 仅环境变量注入（DEEPWIKI_API_KEYS / DEEPWIKI_ADMIN_KEY），yaml 不落明文（硬约束 #2）。

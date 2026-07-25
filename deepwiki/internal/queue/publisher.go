@@ -10,6 +10,8 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
+
+	"deepwiki/internal/observability"
 )
 
 // ErrPublishFailed 投递失败（confirm 未被确认 / mandatory 路由失败 / 连接断开）；
@@ -92,6 +94,7 @@ func (p *amqpPublisher) Publish(ctx context.Context, msg TaskMessage) error {
 		ContentType:  "application/json",
 		Body:         body,
 		DeliveryMode: amqp.Persistent,
+		Headers:      injectTrace(ctx, nil), // W3C traceparent 跨进程传递（总纲 R16）
 	}); err != nil {
 		return fmt.Errorf("%w: publish: %v", ErrPublishFailed, err)
 	}
@@ -102,16 +105,21 @@ func (p *amqpPublisher) Publish(ctx context.Context, msg TaskMessage) error {
 	select {
 	case conf, ok := <-confirms:
 		if !ok {
+			observability.IncRabbitMQPublishConfirm("fail")
 			return ErrPublishFailed
 		}
 		if conf.Ack {
+			observability.IncRabbitMQPublishConfirm("ok")
 			return nil
 		}
+		observability.IncRabbitMQPublishConfirm("fail")
 		return ErrPublishFailed
 	case ret := <-returns:
 		p.logger.Warn("rabbitmq message returned", zap.Uint16("replyCode", ret.ReplyCode), zap.String("replyText", ret.ReplyText))
+		observability.IncRabbitMQPublishConfirm("fail")
 		return ErrPublishFailed
 	case <-ctx.Done():
+		observability.IncRabbitMQPublishConfirm("fail")
 		return ErrPublishFailed
 	}
 }
@@ -148,7 +156,7 @@ func (p *amqpPublisher) publishTo(ctx context.Context, exchange, routingKey stri
 		ContentType:  "application/json",
 		Body:         body,
 		DeliveryMode: amqp.Persistent,
-		Headers:      headers,
+		Headers:      injectTrace(ctx, headers),
 	}); err != nil {
 		return fmt.Errorf("%w: publish: %v", ErrPublishFailed, err)
 	}
@@ -158,10 +166,13 @@ func (p *amqpPublisher) publishTo(ctx context.Context, exchange, routingKey stri
 	select {
 	case conf, ok := <-confirms:
 		if !ok || !conf.Ack {
+			observability.IncRabbitMQPublishConfirm("fail")
 			return ErrPublishFailed
 		}
+		observability.IncRabbitMQPublishConfirm("ok")
 		return nil
 	case <-ctx.Done():
+		observability.IncRabbitMQPublishConfirm("fail")
 		return ErrPublishFailed
 	}
 }

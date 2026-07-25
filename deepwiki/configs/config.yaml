@@ -11,6 +11,7 @@ server:
   cors_allowed_origins:               # 白名单，禁止 "*"
     - "http://localhost:3000"
     - "http://localhost:5173"
+  trusted_proxies: []                   # 可信反代 CIDR；空 = 不信代理，per-IP 限流取 RemoteAddr（§9.1）
 
 rate_limit:                           # 限流数值冻结（总纲 §2.8）；存储为 Redis Lua 滑动窗口
   per_ip:

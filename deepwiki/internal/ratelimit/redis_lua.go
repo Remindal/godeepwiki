@@ -7,6 +7,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+
+	"deepwiki/internal/observability"
 )
 
 // slidingWindowLua 滑动窗口限流脚本（总纲 §4.4 权威脚本，逐字一致，禁止改动）：
@@ -47,6 +49,7 @@ func (l *redisLimiter) Allow(ctx context.Context, key string, window time.Durati
 	res, err := l.script.Run(ctx, l.rdb, []string{key}, nowMs, window.Milliseconds(), limit).Result()
 	if err != nil {
 		l.degraded.Store(true)
+		observability.IncRatelimitDegraded()
 		l.logger.Warn("redis ratelimit failed, fallback to in-process", zap.Error(err))
 		return l.fallback.allow(key, window, limit), nil
 	}
@@ -54,6 +57,7 @@ func (l *redisLimiter) Allow(ctx context.Context, key string, window time.Durati
 	arr, ok := res.([]any)
 	if !ok || len(arr) != 2 {
 		l.degraded.Store(true)
+		observability.IncRatelimitDegraded()
 		return l.fallback.allow(key, window, limit), nil
 	}
 	allowed, _ := arr[0].(int64)

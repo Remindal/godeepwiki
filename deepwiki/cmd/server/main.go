@@ -143,6 +143,8 @@ func main() {
 		// 恢复失败不阻断启动（DLQ/周期巡检兜底），但必须 ERROR 留痕。
 		logger.Error("reconciler recover failed", zap.Error(err))
 	}
+	// 周期恢复：worker 崩溃后 running 僵死任务不等重启即可被重置重投（总纲 §4.3）。
+	reconciler.StartPeriodic(ctx, time.Minute)
 
 	// ⑪ 统一任务系统：事件总线（Redis Streams + Pub/Sub 扇出）+ 消费端 + 有界 Worker Pool。
 	bus := eventbus.NewRedisStreamsBus(rdb, logger)
@@ -333,6 +335,9 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 	snap.Postgres.Connected = pgOK
 	snap.Postgres.Pool.Total = stat.TotalConns()
 	snap.Postgres.Pool.Idle = stat.IdleConns()
+	p.metrics.PgPoolConns.WithLabelValues("total").Set(float64(stat.TotalConns()))
+	p.metrics.PgPoolConns.WithLabelValues("idle").Set(float64(stat.IdleConns()))
+	p.metrics.PgPoolConns.WithLabelValues("acquired").Set(float64(stat.AcquiredConns()))
 	if pgOK {
 		var version uint
 		if err := p.pool.QueryRow(probeCtx, `SELECT version FROM schema_migrations LIMIT 1`).Scan(&version); err == nil {

@@ -2,12 +2,14 @@ package task
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/oklog/ulid/v2"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 
@@ -543,8 +545,8 @@ func retryCount(d amqp.Delivery) int {
 }
 
 func newTaskID() string {
-	// 骨架阶段由调用方生成 task_id；此兜底仅用于测试/异常路径。
-	return fmt.Sprintf("tsk_%d", time.Now().UnixNano())
+	// 兜底生成（正常路径由调用方给 tsk_+ULID；§5.6 ULID 字典序与时间序一致）。
+	return "tsk_" + ulid.MustNew(ulid.Timestamp(time.Now().UTC()), ulid.Monotonic(crand.Reader, 0)).String()
 }
 
 func ptrState(s model.TaskState) *model.TaskState { return &s }

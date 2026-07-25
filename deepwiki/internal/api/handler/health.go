@@ -39,11 +39,6 @@ func respondError(c *gin.Context, code int, message string, details []model.Erro
 	})
 }
 
-// respondNotImplemented 骨架阶段占位：未实现端点统一返回 50001 信封（下一轮逐端点替换为真实实现）。
-func respondNotImplemented(c *gin.Context) {
-	respondError(c, model.CodeInternalError, "internal error: endpoint not implemented yet (scaffold)", nil)
-}
-
 // ---------- HealthSnapshot（60s 后台探测循环写，health 接口只读，毫秒级返回） ----------
 
 // HealthSnapshot 依赖状态快照容器（atomic.Value 持有 dto.HealthResponse 的依赖字段部分；

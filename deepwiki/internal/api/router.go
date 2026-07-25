@@ -46,11 +46,19 @@ type Deps struct {
 func NewRouter(d Deps) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	// TODO（下一轮）：生产经反向代理时 gin.SetTrustedProxies 后才可信 X-Forwarded-For（per-IP 限流取数，§9.1）。
-	r.Use(middleware.RequestID())
-	r.Use(middleware.Recovery(d.Logger))
 
 	cfg := d.Cfg.Get()
+
+	// 可信代理：空列表 = 不信任任何代理（ClientIP=RemoteAddr，忽略 X-Forwarded-For）；
+	// 生产经反向代理时把 LB/Nginx 的 CIDR 配进 server.trusted_proxies（per-IP 限流取数，§9.1）。
+	if len(cfg.Server.TrustedProxies) > 0 {
+		_ = r.SetTrustedProxies(cfg.Server.TrustedProxies)
+	} else {
+		_ = r.SetTrustedProxies(nil)
+	}
+
+	r.Use(middleware.RequestID())
+	r.Use(middleware.Recovery(d.Logger))
 
 	healthH := handler.NewHealthHandler(d.Version, d.StartTime, d.Ready, d.Cfg, d.Snapshot, d.Tasks.Stats, d.Logger)
 	ingestH := handler.NewIngestHandler(d.IngestSvc, d.Logger)
@@ -59,7 +67,7 @@ func NewRouter(d Deps) *gin.Engine {
 	askH := handler.NewAskHandler(d.AskSvc, d.Logger)
 	wikiH := handler.NewWikiHandler(d.WikiSvc, d.Logger)
 	configH := handler.NewConfigHandler(d.Cfg, d.Logger)
-	eventH := handler.NewEventHandler(d.Bus, d.Replayer, d.Logger)
+	eventH := handler.NewEventHandler(d.Bus, d.Replayer, cfg.Server.CORSAllowedOrigins, d.Logger)
 	rateLimiter := middleware.NewRateLimiter(d.Cfg, d.Limiter, d.Logger)
 
 	v1 := r.Group("/api/v1")
