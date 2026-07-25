@@ -15,6 +15,7 @@ import (
 	"deepwiki/internal/api/middleware"
 	"deepwiki/internal/config"
 	"deepwiki/internal/model"
+	"deepwiki/internal/observability"
 	"deepwiki/internal/task"
 )
 
@@ -102,6 +103,7 @@ func (h *HealthHandler) Health(c *gin.Context) {
 	data.Embedding.Model = cfg.Embedding.Model
 	ws := h.worker()
 	data.Worker = dto.WorkerHealth{Busy: ws.Busy, Total: ws.Total, Queued: ws.Queued}
+	observability.SetWorkerBusy(float64(ws.Busy))
 	if !h.ready.Load() { // 优雅退出中：503 + 50301，status 保持原值供诊断（§6.6）
 		c.JSON(http.StatusServiceUnavailable, model.Envelope{
 			Code:      model.CodeServiceNotReady,

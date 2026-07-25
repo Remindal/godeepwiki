@@ -14,6 +14,15 @@ func TestMetricsHandler(t *testing.T) {
 	m.RabbitMQQueueDepth.WithLabelValues("deepwiki.task.jobs").Set(0)
 	m.RedisOpDuration.WithLabelValues("publish").Observe(0.001)
 
+	// 业务指标埋点 helper（经 Default 写入）。
+	IncIngest("success")
+	IncIngest("failure")
+	IncAsk("success")
+	IncAsk("failure")
+	AddChunkIndex(42)
+	SetQueueDepth(3)
+	SetWorkerBusy(1)
+
 	req, _ := http.NewRequest("GET", "/metrics", nil)
 	w := httptest.NewRecorder()
 	promhttp.Handler().ServeHTTP(w, req)
@@ -31,5 +40,16 @@ func TestMetricsHandler(t *testing.T) {
 	}
 	if !strings.Contains(body, "deepwiki_rabbitmq_queue_depth") {
 		t.Fatal("missing deepwiki_rabbitmq_queue_depth metric")
+	}
+	for _, name := range []string{
+		"deepwiki_ingest_total",
+		"deepwiki_ask_total",
+		"deepwiki_chunk_index_total",
+		"deepwiki_queue_depth",
+		"deepwiki_worker_busy",
+	} {
+		if !strings.Contains(body, name) {
+			t.Fatalf("missing %s metric", name)
+		}
 	}
 }

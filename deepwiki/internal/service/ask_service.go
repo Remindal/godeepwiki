@@ -14,6 +14,7 @@ import (
 	"deepwiki/internal/config"
 	"deepwiki/internal/llm"
 	"deepwiki/internal/model"
+	"deepwiki/internal/observability"
 	"deepwiki/internal/retriever"
 	"deepwiki/internal/store"
 )
@@ -37,14 +38,17 @@ func (s *AskService) Ask(ctx context.Context, req dto.AskRequest) (*dto.AskRespo
 
 	mode, topK, temperature, err := s.normalizeAskParams(req)
 	if err != nil {
+		observability.IncAsk("failure")
 		return nil, err
 	}
 	if err := s.ensureRepoReady(ctx, req.RepoID); err != nil {
+		observability.IncAsk("failure")
 		return nil, err
 	}
 
 	hits, err := s.search(ctx, mode, req.RepoID, req.Question, topK)
 	if err != nil {
+		observability.IncAsk("failure")
 		return nil, err
 	}
 	references := buildReferences(hits)
@@ -57,9 +61,11 @@ func (s *AskService) Ask(ctx context.Context, req dto.AskRequest) (*dto.AskRespo
 		MaxTokens:   s.cfg.Get().LLM.MaxTokens,
 	})
 	if err != nil {
+		observability.IncAsk("failure")
 		return nil, mapLLMError(err)
 	}
 
+	observability.IncAsk("success")
 	usage := usageFromResponse(resp)
 	return &dto.AskResponse{
 		Answer:     resp.Content,
@@ -76,14 +82,17 @@ func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink fun
 
 	mode, topK, temperature, err := s.normalizeAskParams(req)
 	if err != nil {
+		observability.IncAsk("failure")
 		return err
 	}
 	if err := s.ensureRepoReady(ctx, req.RepoID); err != nil {
+		observability.IncAsk("failure")
 		return err
 	}
 
 	hits, err := s.search(ctx, mode, req.RepoID, req.Question, topK)
 	if err != nil {
+		observability.IncAsk("failure")
 		return err
 	}
 	if err := sink("references", dto.StreamReferencesEvent{Mode: mode, References: buildReferences(hits)}); err != nil {
@@ -98,6 +107,7 @@ func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink fun
 		MaxTokens:   s.cfg.Get().LLM.MaxTokens,
 	})
 	if err != nil {
+		observability.IncAsk("failure")
 		return mapLLMError(err)
 	}
 
@@ -105,6 +115,7 @@ func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink fun
 	var usage *model.Usage
 	for chunk := range stream {
 		if chunk.Err != nil {
+			observability.IncAsk("failure")
 			return mapLLMError(chunk.Err)
 		}
 		if chunk.Delta != "" {
@@ -119,7 +130,11 @@ func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink fun
 	}
 
 	u := usageFromStream(usage, answer.String())
-	return sink("done", dto.StreamDoneEvent{Usage: u, LatencyMs: time.Since(start).Milliseconds()})
+	if err := sink("done", dto.StreamDoneEvent{Usage: u, LatencyMs: time.Since(start).Milliseconds()}); err != nil {
+		return err
+	}
+	observability.IncAsk("success")
+	return nil
 }
 
 func (s *AskService) normalizeAskParams(req dto.AskRequest) (mode string, topK int, temperature float64, err error) {

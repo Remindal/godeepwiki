@@ -18,6 +18,7 @@ import (
 	"deepwiki/internal/ingest"
 	"deepwiki/internal/llm"
 	"deepwiki/internal/model"
+	"deepwiki/internal/observability"
 	"deepwiki/internal/retriever"
 	"deepwiki/internal/store"
 	"deepwiki/internal/task"
@@ -93,6 +94,7 @@ func (e *IngestExecutor) Execute(ctx context.Context, t *model.Task) error {
 	if runErr != nil {
 		var stageErr *ingest.StageError
 		if errors.As(runErr, &stageErr) {
+			observability.IncIngest("failure")
 			e.failTask(ctx, t.TaskID, stageErr.Stage)
 			e.markRepoError(ctx, repo.RepoID)
 			return nil
@@ -124,6 +126,8 @@ func (e *IngestExecutor) Execute(ctx context.Context, t *model.Task) error {
 	if payload.AutoWiki && e.onAutoWiki != nil {
 		e.onAutoWiki(ctx, repo.RepoID)
 	}
+	observability.IncIngest("success")
+	observability.AddChunkIndex(len(pc.Chunks))
 	return nil
 }
 
@@ -285,6 +289,7 @@ func (e *RefreshExecutor) Execute(ctx context.Context, t *model.Task) error {
 
 	repo.UpdatedAt = time.Now().UTC()
 	_ = e.repos.Update(ctx, repo)
+	observability.AddChunkIndex(len(pc.Chunks))
 	return nil
 }
 

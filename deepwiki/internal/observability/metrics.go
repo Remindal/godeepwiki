@@ -21,11 +21,17 @@ type Metrics struct {
 	VectorSearchDuration    prometheus.Histogram     // deepwiki_vector_search_duration_seconds
 	KeywordSearchDuration   prometheus.Histogram     // deepwiki_keyword_search_duration_seconds
 	RatelimitDegraded       prometheus.Counter       // deepwiki_ratelimit_degraded_total
+	// ---- 业务指标（本轮新增） ----
+	IngestTotal     *prometheus.CounterVec // deepwiki_ingest_total{status=success|failure}
+	AskTotal        *prometheus.CounterVec // deepwiki_ask_total{status=success|failure}
+	ChunkIndexTotal prometheus.Counter     // deepwiki_chunk_index_total
+	QueueDepth      prometheus.Gauge       // deepwiki_queue_depth（RabbitMQ 主队列深度，定时探测写入）
 }
 
 // Register 注册全部指标（promauto 默认注册表；重复注册会 panic，只允许 main 调用一次）。
+// 同时写入包级 Default（业务埋点 helper 的数据源）。
 func Register() *Metrics {
-	return &Metrics{
+	m := &Metrics{
 		WorkerBusy: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "deepwiki_worker_busy", Help: "运行中 worker 数"}),
 		QueueLength: promauto.NewGauge(prometheus.GaugeOpts{
@@ -53,5 +59,53 @@ func Register() *Metrics {
 			Buckets: prometheus.DefBuckets}),
 		RatelimitDegraded: promauto.NewCounter(prometheus.CounterOpts{
 			Name: "deepwiki_ratelimit_degraded_total", Help: "限流降级进程内兜底次数"}),
+		IngestTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "deepwiki_ingest_total", Help: "ingest 任务计数（status=success|failure）"}, []string{"status"}),
+		AskTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "deepwiki_ask_total", Help: "ask 请求计数（status=success|failure）"}, []string{"status"}),
+		ChunkIndexTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "deepwiki_chunk_index_total", Help: "已索引 chunk 总数"}),
+		QueueDepth: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "deepwiki_queue_depth", Help: "RabbitMQ 主队列 deepwiki.task.jobs 深度（定时探测）"}),
+	}
+	Default = m
+	return m
+}
+
+// Default 全局指标集合（main 调用 Register 后写入；未注册时为 nil，helper 全部 no-op，便于单测）。
+var Default *Metrics
+
+// IncIngest ingest 任务计数（status=success|failure）。
+func IncIngest(status string) {
+	if Default != nil {
+		Default.IngestTotal.WithLabelValues(status).Inc()
+	}
+}
+
+// IncAsk ask 请求计数（status=success|failure）。
+func IncAsk(status string) {
+	if Default != nil {
+		Default.AskTotal.WithLabelValues(status).Inc()
+	}
+}
+
+// AddChunkIndex 累计已索引 chunk 数。
+func AddChunkIndex(n int) {
+	if Default != nil && n > 0 {
+		Default.ChunkIndexTotal.Add(float64(n))
+	}
+}
+
+// SetQueueDepth 写入 RabbitMQ 主队列深度（healthProber 定时探测调用）。
+func SetQueueDepth(v float64) {
+	if Default != nil {
+		Default.QueueDepth.Set(v)
+	}
+}
+
+// SetWorkerBusy 写入当前忙碌 worker 数。
+func SetWorkerBusy(v float64) {
+	if Default != nil {
+		Default.WorkerBusy.Set(v)
 	}
 }

@@ -177,6 +177,7 @@ func main() {
 	tm.RegisterExecutor(service.NewRefreshExecutor(taskStore, repoStore, cloner, emb, chunkStore, bus, cm, logger))
 	tm.RegisterExecutor(service.NewWikiExecutor(taskStore, repoStore, wikiStore, retrievers, llmClient, cm, bus, logger))
 	tm.Start(ctx, consumer)
+	tm.StartDLQConsumer(ctx, mq)
 
 	ready := &atomic.Bool{}
 	ready.Store(true)
@@ -342,6 +343,7 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 	if mqErr == nil {
 		p.metrics.QueueLength.Set(float64(depth))
 		p.metrics.RabbitMQQueueDepth.WithLabelValues("deepwiki.task.jobs").Set(float64(depth))
+		observability.SetQueueDepth(float64(depth))
 	} else {
 		degraded = true
 	}

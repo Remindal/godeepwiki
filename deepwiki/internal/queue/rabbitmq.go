@@ -6,6 +6,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
@@ -50,7 +51,9 @@ type TaskMessage struct {
 
 // Conn RabbitMQ 连接封装（拓扑声明、通道工厂、优雅关闭）。
 type Conn struct {
+	mu          sync.Mutex
 	conn        *amqp.Connection
+	url         string
 	logger      *zap.Logger
 	queueMaxLen int // x-max-length = worker.queue_size（默认 100）
 }
@@ -64,7 +67,24 @@ func Dial(ctx context.Context, url string, queueMaxLen int, logger *zap.Logger) 
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq dial: %w", err)
 	}
-	return &Conn{conn: conn, queueMaxLen: queueMaxLen, logger: logger}, nil
+	return &Conn{conn: conn, url: url, queueMaxLen: queueMaxLen, logger: logger}, nil
+}
+
+// EnsureConnection 断线重连：连接已关闭时按原 url 重拨（broker 侧持久拓扑无需重声明）。
+// consumer 监督循环在消费 channel 断开时调用（总纲 §4.3 重试语义）。
+func (c *Conn) EnsureConnection(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil && !c.conn.IsClosed() {
+		return nil
+	}
+	conn, err := amqp.Dial(c.url)
+	if err != nil {
+		return fmt.Errorf("rabbitmq redial: %w", err)
+	}
+	c.conn = conn
+	c.logger.Warn("rabbitmq reconnected")
+	return nil
 }
 
 // DeclareTopology 声明全部拓扑（幂等，可重复调用；总纲 §4.3）：
@@ -138,7 +158,13 @@ func (c *Conn) DeclareTopology(ctx context.Context) error {
 
 // Channel 新建 channel（publisher/consumer 各自持独立 channel，禁止跨 goroutine 共享，amqp091-go 线程安全约束）。
 func (c *Conn) Channel() (*amqp.Channel, error) {
-	return c.conn.Channel()
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil || conn.IsClosed() {
+		return nil, fmt.Errorf("rabbitmq connection closed")
+	}
+	return conn.Channel()
 }
 
 // QueueMaxLen 主队列 x-max-length 配置值（背压预检阈值，Manager.Submit 用）。
