@@ -295,6 +295,13 @@ func (m *Manager) dispatch(ctx context.Context, d amqp.Delivery) {
 		return
 	}
 
+	// amqp091-go 的 Delivery 没有 MessageContext 字段（上游 context 只能经 headers 的
+	// traceparent 传递）；消息处理 ctx 一律以 pool ctx 为基础（保留优雅退出取消语义），
+	// 并从 AMQP headers 提取上游 span context 开启 task.dispatch span（OTel 未启用时零成本）。
+	msgCtx, span := startDispatchSpan(ctx, msg.TaskID, d.Headers)
+	defer span.End()
+	ctx = msgCtx
+
 	firstState, ok := firstStateOf(model.TaskType(msg.Type))
 	if !ok {
 		m.logger.Error("unknown task type in message", zap.String("type", msg.Type), zap.String("task_id", msg.TaskID))
