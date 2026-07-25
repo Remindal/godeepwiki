@@ -95,6 +95,16 @@ func main() {
 	}
 	chunkStore := store.NewChunkStore(db, logger)
 	repoStore := store.NewRepoStore(db, logger)
+
+	// embedding 维度探测依赖（PUT /config 变更 embedding 时校验与库列维度一致，反 AI 错误 #14）。
+	cm.WithDimProbe(
+		func(ecfg config.EmbeddingConfig) (config.DimProber, error) { return embed.New(ecfg, logger) },
+		func(ctx context.Context) (int64, error) {
+			var n int64
+			err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&n)
+			return n, err
+		},
+	)
 	go verifyIndices(ctx, repoStore, chunkStore, searchCli, pool, logger)
 
 	// ⑧ Redis 哨兵 FailoverClient（总纲 §4.4；地址与密码仅环境变量/引导层注入）。

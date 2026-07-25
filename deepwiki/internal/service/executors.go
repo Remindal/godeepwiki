@@ -226,16 +226,50 @@ func (e *RefreshExecutor) Execute(ctx context.Context, t *model.Task) error {
 			return nil
 		}},
 		{Name: model.TaskStateDiffing, Fn: func(ctx context.Context, pc *ingest.PipelineContext) error {
-			// 简化：全量删除旧 chunks，后续重新解析切分。
-			return e.chunks.DeleteByRepo(ctx, repo.RepoID)
-		}},
-		{Name: model.TaskStateChunking, Fn: func(ctx context.Context, pc *ingest.PipelineContext) error {
+			// 真增量 diff：解析当前文件树得 path→hash，与 chunks 表 FileHashes 比对，
+			// 只删除（modified ∪ deleted）对应 chunks，只保留变更文件进入后续阶段。
 			files, err := ingest.ParseFiles(ctx, repo.LocalPath, options)
 			if err != nil {
 				return err
 			}
-			pc.Files = files
-			chunks, err := ingest.ChunkFiles(ctx, repo.RepoID, files, options)
+			oldHashes, err := e.chunks.FileHashes(ctx, repo.RepoID)
+			if err != nil {
+				return err
+			}
+			newHashes := make(map[string]string, len(files))
+			for _, f := range files {
+				newHashes[f.Path] = f.Hash
+			}
+			var dirtyPaths []string
+			var changedFiles []ingest.SourceFile
+			for _, f := range files {
+				if old, ok := oldHashes[f.Path]; !ok || old != f.Hash {
+					dirtyPaths = append(dirtyPaths, f.Path) // 新增或内容变更
+					changedFiles = append(changedFiles, f)
+				}
+			}
+			for p := range oldHashes {
+				if _, ok := newHashes[p]; !ok {
+					dirtyPaths = append(dirtyPaths, p) // 已删除文件
+				}
+			}
+			if len(dirtyPaths) > 0 {
+				if err := e.chunks.DeleteByPaths(ctx, repo.RepoID, dirtyPaths); err != nil {
+					return err
+				}
+			}
+			e.logger.Info("refresh diff done",
+				zap.String("repo_id", repo.RepoID),
+				zap.Int("total_files", len(files)),
+				zap.Int("changed", len(changedFiles)),
+				zap.Int("dirty_paths", len(dirtyPaths)),
+			)
+			pc.Files = changedFiles
+			return nil
+		}},
+		{Name: model.TaskStateChunking, Fn: func(ctx context.Context, pc *ingest.PipelineContext) error {
+			// 仅切分 diffing 阶段筛出的变更文件。
+			chunks, err := ingest.ChunkFiles(ctx, repo.RepoID, pc.Files, options)
 			if err != nil {
 				return err
 			}

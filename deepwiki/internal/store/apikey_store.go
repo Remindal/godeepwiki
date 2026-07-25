@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -28,6 +30,9 @@ type APIKeyStore interface {
 	Upsert(ctx context.Context, k *APIKey) error
 	// GetByHash 认证二级查找的 Postgres 端（Redis 缓存 auth:key:<sha256(key)> TTL 60s 在前）。
 	GetByHash(ctx context.Context, keyHash string) (*APIKey, error)
+	// FindByKey 按明文 key 查找：salt 每 key 随机，须逐条比对 SHA-256(salt‖key)（总纲 R14）。
+	// 未命中或已吊销返回 (nil, nil)。
+	FindByKey(ctx context.Context, key string) (*APIKey, error)
 	// Revoke 吊销：revoked_at = now()；调用方负责 DEL Redis 缓存 auth:key:<sha256(key)>。
 	Revoke(ctx context.Context, keyID string) error
 	// Count 启动时判断是否开发模式（0 = 跳过鉴权并 WARN，语义与基线一致）。
@@ -73,6 +78,32 @@ func (s *pgAPIKeyStore) GetByHash(ctx context.Context, keyHash string) (*APIKey,
 		return nil, err
 	}
 	return &k, nil
+}
+
+func (s *pgAPIKeyStore) FindByKey(ctx context.Context, key string) (*APIKey, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT key_id, name, key_hash, salt, is_admin, revoked_at, created_at
+		FROM api_keys
+		WHERE revoked_at IS NULL
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k APIKey
+		if err := rows.Scan(&k.KeyID, &k.Name, &k.KeyHash, &k.Salt, &k.IsAdmin, &k.RevokedAt, &k.CreatedAt); err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256([]byte(k.Salt + key))
+		if hex.EncodeToString(sum[:]) == k.KeyHash {
+			return &k, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func (s *pgAPIKeyStore) Revoke(ctx context.Context, keyID string) error {

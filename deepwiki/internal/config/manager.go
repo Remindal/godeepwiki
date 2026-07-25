@@ -41,6 +41,15 @@ type ApplyResult struct {
 
 // Manager 配置热更新管理器（§8.2：atomic.Value 持快照；订阅者热生效；
 // 覆写持久化在 etcd（总纲 §4.5），v1 原方案的配置覆写表已废弃）。
+// DimProber embedding 维度探测最小接口（与 embed.Embedder 的 Embed 方法同构；
+// config 包禁止反向依赖 embed 包，经工厂注入，硬约束 #17）。
+type DimProber interface {
+	Embed(ctx context.Context, texts []string) ([][]float32, error)
+}
+
+// DimProbeFactory 按候选配置构造探测用 Embedder（main 注入 embed.New 的适配器）。
+type DimProbeFactory func(cfg EmbeddingConfig) (DimProber, error)
+
 type Manager struct {
 	base     *Config
 	snapshot atomic.Value // *Config
@@ -50,6 +59,16 @@ type Manager struct {
 	mu       sync.Mutex
 	subs     []func(*Config)
 	logger   *zap.Logger
+
+	dimProbeFactory DimProbeFactory          // embedding 维度探测工厂（未注入则跳过探测）
+	chunksCount     func(ctx context.Context) (int64, error) // chunks 表行数（>0 才探测）
+}
+
+// WithDimProbe 注入 embedding 维度探测依赖（main 装配时调用；未调用则 Apply 跳过探测，dev 兼容）。
+func (m *Manager) WithDimProbe(factory DimProbeFactory, chunksCount func(ctx context.Context) (int64, error)) *Manager {
+	m.dimProbeFactory = factory
+	m.chunksCount = chunksCount
+	return m
 }
 
 func NewManager(base *Config, overrides map[string]json.RawMessage, version int64, src *EtcdSource, logger *zap.Logger) *Manager {
@@ -167,10 +186,14 @@ func (m *Manager) Apply(ctx context.Context, patch json.RawMessage, changedBy st
 		return nil, &model.APIError{Code: model.CodeConfigValidationFailed, Message: model.MessageOf(model.CodeConfigValidationFailed), Details: details}
 	}
 
-	// TODO(轮次 3): embedding 维度探测。provider/model/base_url 变更且库中有 chunks 时，
-	// 以新配置 Embed(["dimension probe"]) 比对 dimensions；不一致或探测失败 → 拒绝并提示重建索引。
+	// embedding 维度探测（反 AI 错误 #14 第一道防线）：provider/model/base_url 任一变更且库中有
+	// chunks 时，以新配置 Embed(["dimension probe"]) 比对返回向量维度与库列维度；
+	// 不一致 → 拒绝 + audit rejected；探测失败（API 不通）→ 拒绝；chunks 为空跳过。
 	warnings := []string{}
 	if embeddingChanged(m.Get().Embedding, candidate.Embedding) {
+		if reject := m.probeEmbeddingDimension(ctx, changedBy, candidate); reject != nil {
+			return nil, reject
+		}
 		warnings = append(warnings, "embedding provider changed, existing index may need rebuild")
 	}
 
@@ -368,6 +391,38 @@ func findSecretKeys(m map[string]interface{}, prefix string) []string {
 
 func embeddingChanged(old, new EmbeddingConfig) bool {
 	return old.Provider != new.Provider || old.Model != new.Model || old.BaseURL != new.BaseURL
+}
+
+// probeEmbeddingDimension embedding 变更时的维度探测（Apply 第 2.5 步）。
+// 返回非 nil 表示应拒绝本次变更；chunks 表为空或未注入依赖时跳过（返回 nil）。
+func (m *Manager) probeEmbeddingDimension(ctx context.Context, changedBy string, candidate *Config) *model.APIError {
+	if m.dimProbeFactory == nil || m.chunksCount == nil {
+		return nil
+	}
+	n, err := m.chunksCount(ctx)
+	if err != nil {
+		m.logger.Warn("dimension probe: count chunks failed, skip", zap.Error(err))
+		return nil
+	}
+	if n == 0 {
+		return nil // 新库无需校验
+	}
+
+	prober, err := m.dimProbeFactory(candidate.Embedding)
+	if err != nil {
+		_ = m.writeAudit(ctx, changedBy, nil, "rejected", "dimension probe build failed", 0)
+		return &model.APIError{Code: model.CodeConfigValidationFailed, Message: "探测失败，请确认 provider 可用"}
+	}
+	vecs, err := prober.Embed(ctx, []string{"dimension probe"})
+	if err != nil || len(vecs) == 0 || len(vecs[0]) == 0 {
+		_ = m.writeAudit(ctx, changedBy, nil, "rejected", "dimension probe failed", 0)
+		return &model.APIError{Code: model.CodeConfigValidationFailed, Message: "探测失败，请确认 provider 可用"}
+	}
+	if got, want := len(vecs[0]), m.Get().Storage.Vector.Dimensions; got != want {
+		_ = m.writeAudit(ctx, changedBy, nil, "rejected", fmt.Sprintf("dimension mismatch: got %d want %d", got, want), 0)
+		return &model.APIError{Code: model.CodeConfigValidationFailed, Message: "维度不匹配，需重建索引"}
+	}
+	return nil
 }
 
 // 抑制 "imported and not used"：reflect 目前未使用，但保留便于后续订阅者反射更新；如不需要可删。

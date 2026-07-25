@@ -1,8 +1,13 @@
 package middleware
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -22,6 +27,9 @@ type keyRecord struct {
 	Revoked bool   `json:"revoked"`
 }
 
+// authCacheTTL API key 认证缓存 TTL（60s，总纲 §4.4）。
+const authCacheTTL = 60 * time.Second
+
 // Auth X-API-Key 鉴权（总纲 R14/§4.4；硬约束 #2：密钥只存 SHA-256(salt‖key) 哈希，
 // 禁止明文入 Postgres/etcd/日志）。devMode=true（auth.api_keys 为空）时跳过鉴权并打一次 WARN。
 func Auth(cache redis.UniversalClient, keys store.APIKeyStore, devMode bool, logger *zap.Logger) gin.HandlerFunc {
@@ -36,25 +44,80 @@ func Auth(cache redis.UniversalClient, keys store.APIKeyStore, devMode bool, log
 			c.Next()
 			return
 		}
-		// TODO: 实现二级查找（总纲 R14）：
-		// ① key := c.GetHeader("X-API-Key")；空 → 40101；
-		// ② sum := sha256(key) → GET auth:key:<hex(sum)（Redis 缓存，TTL 60s）；
-		// ③ 缓存未命中 → keys.FindByHash(ctx, sum) 查 Postgres api_keys 表
-		//    （逐条比对 SHA-256(salt‖key)；命中且未吊销 → 回写缓存 {key_id,is_admin,revoked:false}）；
-		// ④ 未命中或已吊销 → 401 + 40101；命中 → c.Set(ContextKeyAPIKey, &rec) 放行；
-		// ⑤ 吊销路径（管理端）必须同时 DEL auth:key:<sha256> 主动失效缓存；
-		// ⑥ Redis 不可用 → 降级直查 Postgres 并记 WARN（可用性优先，不因此拒绝合法请求）。
+
 		key := c.GetHeader("X-API-Key")
 		if key == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, model.Envelope{
-				Code:      model.CodeUnauthorized,
-				Message:   model.MessageOf(model.CodeUnauthorized),
-				RequestID: GetRequestID(c),
-			})
+			rejectUnauthorized(c)
 			return
 		}
+
+		rec, ok := lookupKey(c, cache, keys, key, logger)
+		if !ok {
+			rejectUnauthorized(c)
+			return
+		}
+		c.Set(ContextKeyAPIKey, rec)
 		c.Next()
 	}
+}
+
+// lookupKey 二级查找：Redis 缓存（auth:key:<sha256(key)>，TTL 60s）→ Postgres api_keys 表。
+// Redis 不可用时降级直查 Postgres 并记 WARN（可用性优先，不因此拒绝合法请求）。
+func lookupKey(c *gin.Context, cache redis.UniversalClient, keys store.APIKeyStore, key string, logger *zap.Logger) (*keyRecord, bool) {
+	ctx := c.Request.Context()
+	sum := sha256.Sum256([]byte(key))
+	cacheKey := "auth:key:" + hex.EncodeToString(sum[:])
+
+	// L1 Redis 缓存。
+	if cache != nil {
+		cached, err := cache.Get(ctx, cacheKey).Result()
+		if err == nil {
+			var rec keyRecord
+			if json.Unmarshal([]byte(cached), &rec) == nil {
+				if rec.Revoked {
+					return nil, false
+				}
+				return &rec, true
+			}
+		} else if err != redis.Nil {
+			// Redis 故障：降级直查 Postgres（可用性优先）。
+			logger.Warn("auth cache unavailable, fallback to postgres", zap.Error(err))
+			return lookupDB(ctx, keys, key, nil, logger)
+		}
+	}
+
+	// L2 Postgres（命中回写缓存）。
+	return lookupDB(ctx, keys, key, cache, logger)
+}
+
+// lookupDB 查 api_keys 表；cache 非 nil 时命中回写 auth:key:<sha256(key)>（TTL 60s）。
+func lookupDB(ctx context.Context, keys store.APIKeyStore, key string, cache redis.UniversalClient, logger *zap.Logger) (*keyRecord, bool) {
+	k, err := keys.FindByKey(ctx, key)
+	if err != nil {
+		logger.Error("auth db lookup failed", zap.Error(err))
+		return nil, false
+	}
+	if k == nil { // 未命中或已吊销（GetByHash 语义：revoked_at IS NULL）
+		return nil, false
+	}
+	rec := &keyRecord{KeyID: k.KeyID, IsAdmin: k.IsAdmin, Revoked: false}
+	if cache != nil {
+		sum := sha256.Sum256([]byte(key))
+		if b, err := json.Marshal(rec); err == nil {
+			if err := cache.Set(ctx, "auth:key:"+hex.EncodeToString(sum[:]), b, authCacheTTL).Err(); err != nil {
+				logger.Warn("auth cache write failed", zap.Error(err))
+			}
+		}
+	}
+	return rec, true
+}
+
+func rejectUnauthorized(c *gin.Context) {
+	c.AbortWithStatusJSON(http.StatusUnauthorized, model.Envelope{
+		Code:      model.CodeUnauthorized,
+		Message:   model.MessageOf(model.CodeUnauthorized),
+		RequestID: GetRequestID(c),
+	})
 }
 
 // AdminOnly PUT /api/v1/config 的 admin 鉴权（已鉴权 key 的 is_admin=false → 40301，§5.7）；
@@ -66,7 +129,15 @@ func AdminOnly() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// TODO: kr := rec.(*keyRecord)；kr.IsAdmin → 放行；否则 403 + 40301。
+		kr, ok := rec.(*keyRecord)
+		if !ok || !kr.IsAdmin {
+			c.AbortWithStatusJSON(http.StatusForbidden, model.Envelope{
+				Code:      model.CodeForbidden,
+				Message:   model.MessageOf(model.CodeForbidden),
+				RequestID: GetRequestID(c),
+			})
+			return
+		}
 		c.Next()
 	}
 }
