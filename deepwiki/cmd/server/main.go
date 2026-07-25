@@ -3,6 +3,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,6 +24,7 @@ import (
 
 	"deepwiki/internal/api"
 	"deepwiki/internal/api/handler"
+	"deepwiki/internal/api/middleware"
 	"deepwiki/internal/config"
 	"deepwiki/internal/embed"
 	"deepwiki/internal/eventbus"
@@ -167,6 +171,7 @@ func main() {
 	limiter := ratelimit.NewRedisLimiter(rdb, logger)
 	snapshot := handler.NewHealthSnapshot()
 	apiKeyStore := store.NewAPIKeyStore(db, logger)
+	bootstrapAPIKeys(ctx, cfg.Auth, apiKeyStore, logger)
 	wikiStore := store.NewWikiStore(db, logger)
 	vectorStore := store.NewVectorStore(db, cfg.Storage.Vector.EFSearch, logger)
 	cloner := ingest.NewGitCloner(cfg.Git.BinaryPath, cfg.Git.OpTimeout, logger)
@@ -517,6 +522,42 @@ func rebuildIndex(ctx context.Context, pool *pgxpool.Pool, searchCli *search.Cli
 		return err
 	}
 	return searchCli.BulkIndex(ctx, repoID, chunks)
+}
+
+// bootstrapAPIKeys 启动引导：把 DEEPWIKI_API_KEYS / DEEPWIKI_ADMIN_KEY 中的明文 key
+// 以 SHA-256(salt‖key) 哈希后幂等 upsert 进 api_keys 表（salt 每 key 随机，总纲 R14）。
+// 硬约束 #2：明文 key 只存在于本函数栈帧，禁止入日志/缓存/其他存储；运行期鉴权走哈希比对。
+func bootstrapAPIKeys(ctx context.Context, auth config.AuthConfig, keys store.APIKeyStore, logger *zap.Logger) {
+	upsertOne := func(key string, isAdmin bool) {
+		if key == "" {
+			return
+		}
+		saltBytes := make([]byte, 16)
+		if _, err := rand.Read(saltBytes); err != nil {
+			logger.Error("bootstrap api key: rand salt failed", zap.Error(err))
+			return
+		}
+		salt := hex.EncodeToString(saltBytes)
+		sum := sha256.Sum256([]byte(salt + key))
+		k := &store.APIKey{
+			KeyID:   middleware.NewULID("key_"),
+			KeyHash: hex.EncodeToString(sum[:]),
+			Salt:    salt,
+			IsAdmin: isAdmin,
+		}
+		if err := keys.Upsert(ctx, k); err != nil {
+			logger.Error("bootstrap api key failed", zap.Bool("is_admin", isAdmin), zap.Error(err))
+		}
+	}
+	for _, k := range auth.APIKeys {
+		upsertOne(k, false)
+	}
+	upsertOne(auth.AdminKey, true)
+	if len(auth.APIKeys) > 0 || auth.AdminKey != "" {
+		if n, err := keys.Count(ctx); err == nil {
+			logger.Info("api keys bootstrapped", zap.Int64("active_keys", n))
+		}
+	}
 }
 
 // probeGit git CLI 可用性探测（git --version 解析版本号，总纲 §4.6；

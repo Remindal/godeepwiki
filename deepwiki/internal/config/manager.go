@@ -28,7 +28,14 @@ func MergeOverrides(base *Config, overrides map[string]json.RawMessage) *Config 
 		}
 		setDotted(baseMap, dottedKey, value)
 	}
-	return mapToConfig(baseMap)
+	out := mapToConfig(baseMap)
+	// env 注入项（json:"-"）不经 JSON 合并也不入 etcd，快照重建时必须从 base 保留，
+	// 否则 Auth/DSN/RabbitMQ URL/Redis 密码在快照中丢失（会导致鉴权被误判为 dev 模式）。
+	out.Auth = base.Auth
+	out.Storage.Postgres.DSN = base.Storage.Postgres.DSN
+	out.Queue.RabbitMQ.URL = base.Queue.RabbitMQ.URL
+	out.Redis.Password = base.Redis.Password
+	return out
 }
 
 // ApplyResult PUT /config 成功结果（§6.5 响应 data 的来源，冻结）。
