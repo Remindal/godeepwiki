@@ -3,6 +3,7 @@
 # 注意：本文件中的 deepwiki/deepwiki 与 guest/guest 仅为开发态默认口令占位，禁止用于生产。
 services:
   postgres:
+    restart: unless-stopped
     image: pgvector/pgvector:pg16            # 含 pgvector 扩展（CREATE EXTENSION vector 由迁移完成）
     container_name: deepwiki-postgres
     environment:
@@ -21,6 +22,7 @@ services:
       retries: 20
 
   opensearch:
+    restart: unless-stopped
     image: opensearchproject/opensearch:2.17.1
     container_name: deepwiki-opensearch
     environment:
@@ -48,6 +50,7 @@ services:
       start_period: 30s
 
   rabbitmq:
+    restart: unless-stopped
     image: rabbitmq:3.13.7-management        # management UI 开发态映射到宿主机
     container_name: deepwiki-rabbitmq
     environment:
@@ -66,6 +69,7 @@ services:
       start_period: 20s
 
   redis-master:
+    restart: unless-stopped
     image: redis:7.4.1-alpine
     container_name: deepwiki-redis-master
     command: redis-server --appendonly yes
@@ -78,6 +82,7 @@ services:
       retries: 20
 
   redis-replica-1:
+    restart: unless-stopped
     image: redis:7.4.1-alpine
     container_name: deepwiki-redis-replica-1
     command: redis-server --appendonly yes --replicaof redis-master 6379
@@ -93,6 +98,7 @@ services:
       retries: 20
 
   redis-replica-2:
+    restart: unless-stopped
     image: redis:7.4.1-alpine
     container_name: deepwiki-redis-replica-2
     command: redis-server --appendonly yes --replicaof redis-master 6379
@@ -108,6 +114,7 @@ services:
       retries: 20
 
   redis-sentinel-1:
+    restart: unless-stopped
     image: redis:7.4.1-alpine
     container_name: deepwiki-redis-sentinel-1
     command: ["redis-server", "/tmp/sentinel.conf", "--sentinel"]
@@ -123,6 +130,7 @@ services:
       retries: 20
 
   redis-sentinel-2:
+    restart: unless-stopped
     image: redis:7.4.1-alpine
     container_name: deepwiki-redis-sentinel-2
     command: ["redis-server", "/tmp/sentinel.conf", "--sentinel"]
@@ -138,6 +146,7 @@ services:
       retries: 20
 
   redis-sentinel-3:
+    restart: unless-stopped
     image: redis:7.4.1-alpine
     container_name: deepwiki-redis-sentinel-3
     command: ["redis-server", "/tmp/sentinel.conf", "--sentinel"]
@@ -153,6 +162,7 @@ services:
       retries: 20
 
   etcd:
+    restart: unless-stopped
     image: quay.io/coreos/etcd:v3.5.21       # 开发态单节点；生产 3 节点集群（总纲 §3.2）
     container_name: deepwiki-etcd
     environment:
