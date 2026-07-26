@@ -125,8 +125,12 @@ func (s *postgresTaskStore) UpdateState(ctx context.Context, taskID string, patc
 	}
 
 	if patch.State != nil {
-		if !model.CanTransition(model.TaskState(curState), *patch.State) {
-			return model.ErrInvalidTaskState
+		// 幂等：同状态重复写入视为 no-op（at-least-once 消费下，CAS 抢占后 Pipeline 首个
+		// report 会重复写首阶段状态；硬约束 #18 幂等消费语义）。
+		if *patch.State != model.TaskState(curState) {
+			if !model.CanTransition(model.TaskState(curState), *patch.State) {
+				return model.ErrInvalidTaskState
+			}
 		}
 		if patch.State.IsTerminal() && patch.FinishedAt == nil {
 			now := time.Now().UTC()

@@ -95,6 +95,11 @@ func (e *IngestExecutor) Execute(ctx context.Context, t *model.Task) error {
 		var stageErr *ingest.StageError
 		if errors.As(runErr, &stageErr) {
 			observability.IncIngest("failure")
+			e.logger.Error("ingest stage failed",
+				zap.String("task_id", t.TaskID),
+				zap.String("stage", string(stageErr.Stage)),
+				zap.Error(stageErr.Err),
+			)
 			e.failTask(ctx, t.TaskID, stageErr.Stage)
 			e.markRepoError(ctx, repo.RepoID)
 			return nil
