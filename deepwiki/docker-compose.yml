@@ -217,10 +217,8 @@ services:
       retries: 6
       start_period: 30s
     environment:
-      # 外网（provider API / git clone）走宿主机 Clash Verge 代理（端口 7897）；
-      # 集群内服务名与环回必须绕过代理，否则 gRPC/etcd 经代理不可达，启动卡在 etcd LoadAll。
-      - HTTP_PROXY=http://host.docker.internal:7897
-      - HTTPS_PROXY=http://host.docker.internal:7897
+      # 全直连（用户自带网络，无需代理）。NO_PROXY 保留：将来若需恢复代理，
+      # 只需补回 HTTP_PROXY/HTTPS_PROXY 两行即可，集群内服务与 SiliconFlow 依然直连。
       - NO_PROXY=etcd,postgres,rabbitmq,opensearch,redis-master,redis-replica-1,redis-replica-2,redis-sentinel-1,redis-sentinel-2,redis-sentinel-3,localhost,127.0.0.1,host.docker.internal,api.siliconflow.cn
       - no_proxy=etcd,postgres,rabbitmq,opensearch,redis-master,redis-replica-1,redis-replica-2,redis-sentinel-1,redis-sentinel-2,redis-sentinel-3,localhost,127.0.0.1,host.docker.internal,api.siliconflow.cn
 
