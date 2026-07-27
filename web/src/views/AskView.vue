@@ -196,9 +196,15 @@ async function ask(question: string) {
     await done
   } catch (e) {
     ai.streaming = false
-    if (e instanceof ApiError) ai.content = `出错了：${e.message}`
-    else if ((e as Error).name !== 'AbortError') ai.content = '连接中断，请重试'
-    ElMessage.error(ai.content)
+    if ((e as Error).name === 'AbortError') {
+      // 用户离开页面主动中断：属预期行为，不弹错误提示，已生成内容原样保留。
+    } else if (e instanceof ApiError) {
+      ai.content = `出错了：${e.message}`
+      ElMessage.error(ai.content)
+    } else {
+      ai.content = '连接中断，请重试'
+      ElMessage.error(ai.content)
+    }
   } finally {
     streaming.value = false
     abort = null
