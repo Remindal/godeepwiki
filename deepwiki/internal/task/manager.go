@@ -198,6 +198,7 @@ func (m *Manager) Submit(ctx context.Context, t *model.Task) error {
 		if err := m.store.Create(ctx, t); err != nil {
 			return err
 		}
+		m.releaseRefreshLock(ctx, t) // 队列满直接终态：立即放锁，防泄漏
 		return model.ErrQueueFull
 	}
 
@@ -214,7 +215,8 @@ func (m *Manager) Submit(ctx context.Context, t *model.Task) error {
 	// ④ 投递瘦消息。
 	msg := queue.TaskMessage{TaskID: t.TaskID, Type: string(t.Type)}
 	if err := m.publisher.Publish(ctx, msg); err != nil {
-		// 投递失败：任务落 failed(50302)。
+		// 投递失败：任务落 failed(50302)，并立即释放 refresh 锁（否则泄漏到 TTL 才解，
+		// 期间同仓 refresh 全部被误判为"进行中"）。
 		if ext, ok := m.store.(storeExt); ok {
 			_ = ext.FailTask(ctx, t.TaskID, &model.TaskError{
 				Code:    model.CodeQueueUnavailable,
@@ -222,6 +224,7 @@ func (m *Manager) Submit(ctx context.Context, t *model.Task) error {
 				Stage:   string(model.TaskStatePending),
 			})
 		}
+		m.releaseRefreshLock(ctx, t)
 		return model.ErrQueueUnavailable
 	}
 
@@ -358,6 +361,7 @@ func (m *Manager) dispatch(ctx context.Context, d amqp.Delivery) {
 			Message: model.MessageOf(model.CodeInternalError),
 			Stage:   string(t.State),
 		})
+		m.releaseRefreshLock(ctx, t)
 		_ = d.Ack(false)
 		return
 	}
@@ -421,12 +425,13 @@ func (m *Manager) resetAndRetry(ctx context.Context, d amqp.Delivery, msg queue.
 		}
 	}
 
-	// 重试耗尽或 publisher 不支持重试扩展：落 failed(50003) 并进 DLQ 审计。
+	// 重试耗尽或 publisher 不支持重试扩展：落 failed(50003) 并进 DLQ 审计；refresh 锁一并释放。
 	_ = ext.FailTask(ctx, msg.TaskID, &model.TaskError{
 		Code:    50003,
 		Message: "task retry exhausted",
 		Stage:   string(model.TaskStateFailed),
 	})
+	m.releaseRefreshLockByID(ctx, msg.TaskID)
 	if rp, ok := m.publisher.(queue.RetryPublisher); ok {
 		_ = rp.PublishToDLQ(ctx, msg)
 	}
@@ -448,6 +453,15 @@ func (m *Manager) finishTerminal(ctx context.Context, taskID string, state model
 		return err
 	}
 	return nil
+}
+
+// releaseRefreshLockByID 按 taskID 释放 refresh 锁（dispatch 中拿不到完整 task 时用）。
+func (m *Manager) releaseRefreshLockByID(ctx context.Context, taskID string) {
+	repoID := ""
+	if t, err := m.store.Get(ctx, taskID); err == nil { // store 自身线程安全，不持 m.mu，避免嵌套锁
+		repoID = t.RepoID
+	}
+	m.releaseRefreshLock(ctx, &model.Task{TaskID: taskID, Type: model.TaskTypeRefresh, RepoID: repoID})
 }
 
 func (m *Manager) releaseRefreshLock(ctx context.Context, t *model.Task) {
