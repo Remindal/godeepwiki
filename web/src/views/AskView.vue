@@ -6,7 +6,7 @@
           <div class="empty-logo">DW</div>
           <p class="dw-muted">向这个仓库提问，回答都会附上代码出处</p>
           <div class="hints">
-            <div v-for="h in hints" :key="h" class="hint dw-card" @click="ask(h)">{{ h }}</div>
+            <div v-for="h in hints" :key="h" class="hint dw-card" @click="submit(h)">{{ h }}</div>
           </div>
         </div>
 
@@ -62,7 +62,7 @@
           rows="1"
           placeholder="提问，Enter 发送，Shift+Enter 换行"
           :disabled="streaming"
-          @keydown.enter.exact.prevent="ask(input)"
+          @keydown.enter.exact.prevent="submit(input)"
         />
         <div class="input-side">
           <el-select v-model="mode" size="small" class="mode-select" :disabled="streaming">
@@ -70,7 +70,7 @@
             <el-option label="向量检索" value="embedding" />
             <el-option label="关键词检索" value="keyword" />
           </el-select>
-          <button class="send-btn" :disabled="!input.trim() || streaming" @click="ask(input)">
+          <button class="send-btn" :disabled="!input.trim() || streaming" @click="submit(input)">
             {{ streaming ? '…' : '↑' }}
           </button>
         </div>
@@ -80,73 +80,23 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { marked } from 'marked'
-import { ElMessage } from 'element-plus'
-import { streamSSE, ApiError } from '../api/client'
-import type { Reference } from '../api/types'
-
-interface Msg {
-  role: 'user' | 'ai'
-  content: string
-  thinking?: string
-  thinkingOpen?: boolean
-  streaming?: boolean
-  references?: Reference[]
-  refsOpen?: boolean
-  usage?: { prompt_tokens: number; completion_tokens: number }
-  latency_ms?: number
-}
-
-// 聊天历史按仓库存 localStorage（后端 ask 无状态，会话为前端产物）。
-// 只存最终态字段，最多保留最近 50 条。
-const CHAT_MAX = 50
-const chatKey = () => `dw_chat_${repoId}`
-
-function loadHistory(): Msg[] {
-  try {
-    const raw = localStorage.getItem(chatKey())
-    if (!raw) return []
-    const list = JSON.parse(raw) as Msg[]
-    return Array.isArray(list) ? list : []
-  } catch {
-    return []
-  }
-}
-
-function saveHistory(list: Msg[]) {
-  try {
-    const finalized = list
-      .filter((m) => !m.streaming)
-      .slice(-CHAT_MAX)
-      .map((m) => ({
-        role: m.role,
-        content: m.content,
-        references: m.references,
-        usage: m.usage,
-        latency_ms: m.latency_ms,
-      }))
-    localStorage.setItem(chatKey(), JSON.stringify(finalized))
-  } catch { /* 存储满等异常静默 */ }
-}
-
-function clearHistory() {
-  messages.value = []
-  localStorage.removeItem(chatKey())
-}
+import { ask, clearChat, getChat } from '../stores/chat'
 
 const route = useRoute()
 const repoId = route.params.repoId as string
 const input = ref('')
 const mode = ref('hybrid')
-const streaming = ref(false)
-const messages = ref<Msg[]>(loadHistory())
 const scrollEl = ref<HTMLElement>()
 
-const hints = ['这个仓库是干什么的？', '核心入口函数在哪里？', '路由是怎么注册和匹配的？']
+// 会话来自模块级仓库：离开页面流式在后台续跑，回来接着看（市面 AI 对话行为）。
+const chat = getChat(repoId)
+const messages = computed(() => chat.messages)
+const streaming = computed(() => chat.streaming)
 
-let abort: (() => void) | null = null
+const hints = ['这个仓库是干什么的？', '核心入口函数在哪里？', '路由是怎么注册和匹配的？']
 
 function renderMd(text: string) {
   return marked.parse(text || '', { async: false })
@@ -157,71 +107,17 @@ async function scrollBottom() {
   scrollEl.value?.scrollTo({ top: scrollEl.value.scrollHeight })
 }
 
-async function ask(question: string) {
+function submit(question: string) {
   const q = question.trim()
   if (!q || streaming.value) return
   input.value = ''
-  // 多轮上下文：取最近 6 条已完成消息（不含本轮），随请求传给后端拼 prompt。
-  const history = messages.value
-    .filter((m) => !m.streaming)
-    .slice(-6)
-    .map((m) => ({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }))
-
-  messages.value.push({ role: 'user', content: q })
-  const ai: Msg = { role: 'ai', content: '', thinking: '', streaming: true, refsOpen: false }
-  messages.value.push(ai)
-  streaming.value = true
-  scrollBottom()
-  saveHistory(messages.value)
-
-  const { abort: ab, done } = streamSSE(
-    '/api/v1/ask/stream',
-    { method: 'POST', body: { repo_id: repoId, question: q, mode: mode.value, top_k: 8, history } },
-    (frame) => {
-      try {
-        const payload = JSON.parse(frame.data)
-        if (frame.event === 'references') {
-          ai.references = payload.references
-        } else if (frame.event === 'thinking') {
-          // thinking 模型推理段：独立折叠灰显（Kimi 风格），不计入正式答案
-          ai.thinking = (ai.thinking || '') + payload.delta
-        } else if (frame.event === 'token') {
-          ai.content += payload.delta
-        } else if (frame.event === 'done') {
-          ai.usage = payload.usage
-          ai.latency_ms = payload.latency_ms
-          ai.streaming = false
-        } else if (frame.event === 'error') {
-          ai.content = `出错了：${payload.message}`
-          ai.streaming = false
-        }
-        scrollBottom()
-      } catch { /* 忽略非 JSON 帧 */ }
-    },
-  )
-  abort = ab
-  try {
-    await done
-  } catch (e) {
-    ai.streaming = false
-    if ((e as Error).name === 'AbortError') {
-      // 用户离开页面主动中断：属预期行为，不弹错误提示，已生成内容原样保留。
-    } else if (e instanceof ApiError) {
-      ai.content = `出错了：${e.message}`
-      ElMessage.error(ai.content)
-    } else {
-      ai.content = '连接中断，请重试'
-      ElMessage.error(ai.content)
-    }
-  } finally {
-    streaming.value = false
-    abort = null
-    saveHistory(messages.value)
-    scrollBottom()
-  }
+  // fire-and-forget：组件只负责发起与滚动，生命周期不影响后台续跑。
+  void ask(repoId, q, mode.value, scrollBottom)
 }
 
-onBeforeUnmount(() => abort?.())
+function clearHistory() {
+  clearChat(repoId)
+}
 </script>
 
 <style scoped>

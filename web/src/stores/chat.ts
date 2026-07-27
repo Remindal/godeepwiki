@@ -1,0 +1,144 @@
+import { reactive } from 'vue'
+import { ElMessage } from 'element-plus'
+import { streamSSE, ApiError } from '../api/client'
+import type { Reference } from '../api/types'
+
+export interface ChatMsg {
+  role: 'user' | 'ai'
+  content: string
+  thinking?: string
+  thinkingOpen?: boolean
+  streaming?: boolean
+  references?: Reference[]
+  refsOpen?: boolean
+  usage?: { prompt_tokens: number; completion_tokens: number }
+  latency_ms?: number
+}
+
+export interface ChatSession {
+  messages: ChatMsg[]
+  streaming: boolean
+  abort?: () => void
+}
+
+// 会话仓库：模块级单例，不随路由组件销毁——离开页面流式继续在后台跑（市面 AI 对话行为）。
+const sessions = reactive(new Map<string, ChatSession>())
+
+const CHAT_MAX = 50
+const chatKey = (repoId: string) => `dw_chat_${repoId}`
+
+function loadHistory(repoId: string): ChatMsg[] {
+  try {
+    const raw = localStorage.getItem(chatKey(repoId))
+    if (!raw) return []
+    const list = JSON.parse(raw) as ChatMsg[]
+    return Array.isArray(list) ? list : []
+  } catch {
+    return []
+  }
+}
+
+function saveHistory(repoId: string, list: ChatMsg[]) {
+  try {
+    const finalized = list
+      .filter((m) => !m.streaming)
+      .slice(-CHAT_MAX)
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        thinking: m.thinking,
+        references: m.references,
+        usage: m.usage,
+        latency_ms: m.latency_ms,
+      }))
+    localStorage.setItem(chatKey(repoId), JSON.stringify(finalized))
+  } catch { /* 存储满等异常静默 */ }
+}
+
+export function getChat(repoId: string): ChatSession {
+  let s = sessions.get(repoId)
+  if (!s) {
+    s = reactive<ChatSession>({ messages: loadHistory(repoId), streaming: false })
+    sessions.set(repoId, s)
+  }
+  return s
+}
+
+export function clearChat(repoId: string) {
+  const s = getChat(repoId)
+  s.abort?.()
+  s.messages = []
+  s.streaming = false
+  localStorage.removeItem(chatKey(repoId))
+}
+
+// ask 在会话仓库层发起流式请求；调用方（组件）只负责渲染与滚动。
+// onUpdate 在每帧后回调（组件用来滚到底部），组件卸载后传 null 也不影响后台续跑。
+export async function ask(
+  repoId: string,
+  question: string,
+  mode: string,
+  onUpdate?: () => void,
+): Promise<void> {
+  const s = getChat(repoId)
+  const q = question.trim()
+  if (!q || s.streaming) return
+
+  const history = s.messages
+    .filter((m) => !m.streaming)
+    .slice(-6)
+    .map((m) => ({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }))
+
+  s.messages.push({ role: 'user', content: q })
+  const ai: ChatMsg = { role: 'ai', content: '', thinking: '', streaming: true, refsOpen: false, thinkingOpen: false }
+  s.messages.push(ai)
+  s.streaming = true
+  saveHistory(repoId, s.messages)
+  onUpdate?.()
+
+  const { abort, done } = streamSSE(
+    '/api/v1/ask/stream',
+    { method: 'POST', body: { repo_id: repoId, question: q, mode, top_k: 8, history } },
+    (frame) => {
+      try {
+        const payload = JSON.parse(frame.data)
+        if (frame.event === 'references') {
+          ai.references = payload.references
+        } else if (frame.event === 'thinking') {
+          ai.thinking = (ai.thinking || '') + payload.delta
+        } else if (frame.event === 'token') {
+          ai.content += payload.delta
+        } else if (frame.event === 'done') {
+          ai.usage = payload.usage
+          ai.latency_ms = payload.latency_ms
+          ai.streaming = false
+        } else if (frame.event === 'error') {
+          ai.content = `出错了：${payload.message}`
+          ai.streaming = false
+        }
+        onUpdate?.()
+      } catch { /* 忽略非 JSON 帧 */ }
+    },
+  )
+  s.abort = abort
+
+  try {
+    await done
+  } catch (e) {
+    ai.streaming = false
+    if ((e as Error).name === 'AbortError') {
+      // 显式停止：静默收尾，保留已生成内容。
+    } else if (e instanceof ApiError) {
+      ai.content = `出错了：${e.message}`
+      ElMessage.error(ai.content)
+    } else {
+      ai.content = '连接中断，请重试'
+      ElMessage.error(ai.content)
+    }
+  } finally {
+    s.streaming = false
+    s.abort = undefined
+    saveHistory(repoId, s.messages)
+    onUpdate?.()
+  }
+}
