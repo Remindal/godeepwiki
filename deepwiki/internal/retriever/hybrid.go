@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -94,7 +95,9 @@ func rrfFuse(k, topK int, lists ...[]model.ChunkHit) []model.ChunkHit {
 	}
 	out := make([]model.ChunkHit, 0, len(byID))
 	for _, m := range byID {
-		m.hit.Score = m.score
+		// 语言权重：docs 类（markdown/text 等）降权，避免代码实现被文档挤出 topK
+		// （BM25 对自然语言文档天然友好，代码片段需要权重补偿）。
+		m.hit.Score = m.score * langWeight(m.hit.Chunk.Language)
 		out = append(out, m.hit)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -104,6 +107,16 @@ func rrfFuse(k, topK int, lists ...[]model.ChunkHit) []model.ChunkHit {
 		return out[i].Chunk.ChunkID < out[j].Chunk.ChunkID // 分数相同时按 ID 定序，保证结果稳定
 	})
 	return truncateHits(out, topK)
+}
+
+// langWeight 按 chunk 语言返回排序权重：代码 1.0，文档 0.75。
+func langWeight(lang string) float64 {
+	switch strings.ToLower(lang) {
+	case "markdown", "md", "text", "txt", "rst", "adoc", "html", "":
+		return 0.75
+	default:
+		return 1.0
+	}
 }
 
 // truncateHits 截断到 topK；topK ≤ 0 表示不截断。
