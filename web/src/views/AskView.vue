@@ -45,6 +45,10 @@
       </div>
     </div>
 
+    <div v-if="messages.length" class="chat-toolbar">
+      <button class="clear-btn dw-faint" @click="clearHistory">清空对话</button>
+    </div>
+
     <div class="input-bar">
       <div class="input-inner dw-card">
         <textarea
@@ -89,12 +93,49 @@ interface Msg {
   latency_ms?: number
 }
 
+// 聊天历史按仓库存 localStorage（后端 ask 无状态，会话为前端产物）。
+// 只存最终态字段，最多保留最近 50 条。
+const CHAT_MAX = 50
+const chatKey = () => `dw_chat_${repoId}`
+
+function loadHistory(): Msg[] {
+  try {
+    const raw = localStorage.getItem(chatKey())
+    if (!raw) return []
+    const list = JSON.parse(raw) as Msg[]
+    return Array.isArray(list) ? list : []
+  } catch {
+    return []
+  }
+}
+
+function saveHistory(list: Msg[]) {
+  try {
+    const finalized = list
+      .filter((m) => !m.streaming)
+      .slice(-CHAT_MAX)
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        references: m.references,
+        usage: m.usage,
+        latency_ms: m.latency_ms,
+      }))
+    localStorage.setItem(chatKey(), JSON.stringify(finalized))
+  } catch { /* 存储满等异常静默 */ }
+}
+
+function clearHistory() {
+  messages.value = []
+  localStorage.removeItem(chatKey())
+}
+
 const route = useRoute()
 const repoId = route.params.repoId as string
 const input = ref('')
 const mode = ref('hybrid')
 const streaming = ref(false)
-const messages = ref<Msg[]>([])
+const messages = ref<Msg[]>(loadHistory())
 const scrollEl = ref<HTMLElement>()
 
 const hints = ['这个仓库是干什么的？', '核心入口函数在哪里？', '路由是怎么注册和匹配的？']
@@ -119,6 +160,7 @@ async function ask(question: string) {
   messages.value.push(ai)
   streaming.value = true
   scrollBottom()
+  saveHistory(messages.value)
 
   const { abort: ab, done } = streamSSE(
     '/api/v1/ask/stream',
@@ -154,6 +196,7 @@ async function ask(question: string) {
   } finally {
     streaming.value = false
     abort = null
+    saveHistory(messages.value)
     scrollBottom()
   }
 }
@@ -208,6 +251,23 @@ onBeforeUnmount(() => abort?.())
 .ref-path { font-size: 12px; font-weight: 600; font-family: ui-monospace, monospace; }
 .ref-snippet { font-size: 12px; margin-top: 2px; }
 .usage { font-size: 11px; margin-top: 6px; }
+
+.chat-toolbar {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 20px 4px;
+  display: flex;
+  justify-content: flex-end;
+}
+.clear-btn {
+  border: none;
+  background: none;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+.clear-btn:hover { background: var(--dw-bg-mute); color: var(--dw-text); }
 
 .input-bar { padding: 12px 20px 20px; }
 .input-inner {
