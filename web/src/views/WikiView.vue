@@ -3,7 +3,10 @@
     <aside class="wiki-toc">
       <div class="toc-head">
         <span class="toc-title">Wiki</span>
-        <el-button size="small" text @click="generate" :loading="generating">重新生成</el-button>
+        <div>
+          <el-button v-if="wiki" size="small" text @click="download">下载</el-button>
+          <el-button size="small" text @click="generate" :loading="generating">重新生成</el-button>
+        </div>
       </div>
       <div v-if="wiki?.toc?.length" class="toc-list">
         <div
@@ -58,6 +61,11 @@ async function load() {
       ElMessage.error(e instanceof Error ? e.message : '加载失败')
     }
   }
+}
+
+function download() {
+  // 浏览器原生下载（响应为 attachment 字节流，不走 envelope）。
+  window.open(`/api/v1/repos/${repoId}/wiki/export`, '_blank')
 }
 
 async function generate() {

@@ -89,6 +89,7 @@ func NewRouter(d Deps) *gin.Engine {
 		v1.POST("/ask/stream", askH.AskStream)                     // 12
 		v1.POST("/wiki/generate", wikiH.Generate)                  // 13
 		v1.GET("/repos/:repo_id/wiki", wikiH.GetWiki)              // 14
+		v1.GET("/repos/:repo_id/wiki/export", wikiH.Export)       // 14b wiki 导出下载
 		v1.GET("/config", configH.GetConfig)                       // 15
 		v1.PUT("/config", middleware.AdminOnly(), configH.UpdateConfig) // 16
 		v1.GET("/events", eventH.Events)                           // 17
