@@ -27,6 +27,8 @@ func newOpenAIClient(cfg config.EmbeddingConfig, defaultBaseURL string) openai.C
 }
 
 // embedWithOpenAI 使用 openai-go 批量向量化；dims 指针用于未知模型时探测维度。
+// maxRunes 单条输入 rune 上限（0=不截断）：bge-large-zh 等模型输入上限 512 tokens，
+// CJK 字符约 1 token/字，超限会被 provider 400 拒绝（反 AI 错误 #14 输入侧防线）。
 func embedWithOpenAI(
 	ctx context.Context,
 	client openai.Client,
@@ -36,10 +38,12 @@ func embedWithOpenAI(
 	breaker *gobreaker.CircuitBreaker[any],
 	logger *zap.Logger,
 	texts []string,
+	maxRunes int,
 ) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
+	texts = clampEmbeddingInputs(texts, maxRunes, logger)
 	if batchSize <= 0 {
 		batchSize = 64
 	}
@@ -83,6 +87,29 @@ func embedWithOpenAI(
 		return nil, fmt.Errorf("embedding unavailable: %w", err)
 	}
 	return result.([][]float32), nil
+}
+
+// clampEmbeddingInputs 截断超长输入（按 rune；截断记 WARN，不中断流程）。
+func clampEmbeddingInputs(texts []string, maxRunes int, logger *zap.Logger) []string {
+	if maxRunes <= 0 {
+		return texts
+	}
+	out := make([]string, len(texts))
+	truncated := 0
+	for i, t := range texts {
+		r := []rune(t)
+		if len(r) > maxRunes {
+			out[i] = string(r[:maxRunes])
+			truncated++
+		} else {
+			out[i] = t
+		}
+	}
+	if truncated > 0 {
+		logger.Warn("embedding inputs truncated to provider token cap",
+			zap.Int("truncated", truncated), zap.Int("total", len(texts)), zap.Int("max_runes", maxRunes))
+	}
+	return out
 }
 
 // fallbackDimensions 按模型名兜底维度（仅用于返回 Dimensions()，真实维度以首次请求探测为准）。

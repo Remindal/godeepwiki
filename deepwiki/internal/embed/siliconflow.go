@@ -38,8 +38,11 @@ func NewSiliconFlowEmbedder(cfg config.EmbeddingConfig, breaker *gobreaker.Circu
 	}
 }
 
+// siliconflowMaxInputRunes bge 系列输入上限 512 tokens 的保守 rune 上限（CJK≈1 token/字）。
+const siliconflowMaxInputRunes = 480
+
 func (e *SiliconFlowEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	return embedWithOpenAI(ctx, e.client, e.cfg.Model, &e.dims, e.cfg.BatchSize, e.breaker, e.logger, texts)
+	return embedWithOpenAI(ctx, e.client, e.cfg.Model, &e.dims, e.cfg.BatchSize, e.breaker, e.logger, texts, siliconflowMaxInputRunes)
 }
 
 func (e *SiliconFlowEmbedder) Ping(ctx context.Context) error {

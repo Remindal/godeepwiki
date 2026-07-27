@@ -39,7 +39,7 @@ func NewVoyageEmbedder(cfg config.EmbeddingConfig, breaker *gobreaker.CircuitBre
 }
 
 func (e *VoyageEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	return embedWithOpenAI(ctx, e.client, e.cfg.Model, &e.dims, e.cfg.BatchSize, e.breaker, e.logger, texts)
+	return embedWithOpenAI(ctx, e.client, e.cfg.Model, &e.dims, e.cfg.BatchSize, e.breaker, e.logger, texts, 0)
 }
 
 func (e *VoyageEmbedder) Ping(ctx context.Context) error {

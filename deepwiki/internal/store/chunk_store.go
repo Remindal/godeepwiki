@@ -2,8 +2,9 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
@@ -61,23 +62,47 @@ func (s *pgChunkStore) InsertBatch(ctx context.Context, chunks []model.Chunk) er
 		if end > len(chunks) {
 			end = len(chunks)
 		}
-		rows := make([][]interface{}, 0, end-start)
-		for _, c := range chunks[start:end] {
-			var emb interface{}
-			if len(c.Vector) > 0 {
-				emb = pgvector.NewVector(c.Vector)
-			}
-			rows = append(rows, []interface{}{
-				c.ChunkID, c.RepoID, c.Path, c.StartLine, c.EndLine,
-				c.Language, c.Content, c.FileHash, c.EmbeddingModel, emb,
-			})
-		}
-		_, err := s.pool.CopyFrom(ctx, pgx.Identifier{"chunks"}, chunkColumns, pgx.CopyFromRows(rows))
-		if err != nil {
+		// 参数化多行 INSERT（CopyFrom 对 pgvector.Vector 编码有误，二进制 COPY 下会报
+		// "vector cannot have more than 16000 dimensions"，参数化 INSERT 为已验证路径）。
+		sql, args := buildChunkInsert(chunks[start:end])
+		if _, err := s.pool.Exec(ctx, sql, args...); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// buildChunkInsert 构造 INSERT INTO chunks (...) VALUES (...),(...),... 与参数（每行 10 个 $n）。
+func buildChunkInsert(chunks []model.Chunk) (string, []interface{}) {
+	const cols = 10
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO chunks (")
+	sb.WriteString(strings.Join(chunkColumns, ", "))
+	sb.WriteString(") VALUES ")
+	args := make([]interface{}, 0, len(chunks)*cols)
+	for i, c := range chunks {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("(")
+		base := i * cols
+		for j := 0; j < cols; j++ {
+			if j > 0 {
+				sb.WriteString(",")
+			}
+			fmt.Fprintf(&sb, "$%d", base+j+1)
+		}
+		sb.WriteString(")")
+		var emb interface{}
+		if len(c.Vector) > 0 {
+			emb = pgvector.NewVector(c.Vector)
+		}
+		args = append(args,
+			c.ChunkID, c.RepoID, c.Path, c.StartLine, c.EndLine,
+			c.Language, c.Content, c.FileHash, c.EmbeddingModel, emb,
+		)
+	}
+	return sb.String(), args
 }
 
 func (s *pgChunkStore) GetByID(ctx context.Context, chunkID string) (*model.Chunk, error) {

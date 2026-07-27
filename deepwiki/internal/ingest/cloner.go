@@ -46,6 +46,7 @@ func NewGitCloner(binaryPath string, opTimeout time.Duration, logger *zap.Logger
 var _ Cloner = (*GitCloner)(nil)
 
 // Clone 浅克隆指定分支到 destDir；branch 为空时取远端默认分支。
+// git clone 失败（GFW 指纹封锁/代理不稳定）自动降级 tarball 下载（Go net/http，TLS 指纹可用）。
 func (c *GitCloner) Clone(ctx context.Context, url, branch, destDir string) error {
 	// 硬约束 #5：禁止 git pull；硬约束 #11：参数必须独立数组元素，禁止 sh -c；路径经 filepath.Clean 防穿越。
 	destDir, err := validatePath(destDir)
@@ -60,8 +61,13 @@ func (c *GitCloner) Clone(ctx context.Context, url, branch, destDir string) erro
 
 	_, stderr, err := c.run(ctx, c.cloneTimeout(), args...)
 	if err != nil {
-		c.logger.Error("git clone failed", zap.String("url", url), zap.String("branch", branch), zap.String("dest", destDir), zap.String("stderr", truncate(stderr, 1024)), zap.Error(err))
-		return fmt.Errorf("git clone: %w", err)
+		c.logger.Warn("git clone failed, fallback to tarball",
+			zap.String("url", url), zap.String("branch", branch), zap.String("dest", destDir),
+			zap.String("stderr", truncate(stderr, 512)), zap.Error(err))
+		if tbErr := c.cloneViaTarball(ctx, url, branch, destDir); tbErr != nil {
+			c.logger.Error("git clone failed (tarball fallback also failed)", zap.String("url", url), zap.Error(tbErr))
+			return fmt.Errorf("git clone: %w", err)
+		}
 	}
 	return nil
 }

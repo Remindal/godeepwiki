@@ -38,7 +38,7 @@ func NewOpenAIEmbedder(cfg config.EmbeddingConfig, breaker *gobreaker.CircuitBre
 }
 
 func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	return embedWithOpenAI(ctx, e.client, e.cfg.Model, &e.dims, e.cfg.BatchSize, e.breaker, e.logger, texts)
+	return embedWithOpenAI(ctx, e.client, e.cfg.Model, &e.dims, e.cfg.BatchSize, e.breaker, e.logger, texts, 0)
 }
 
 // Ping 健康探测：用最小输入试调用一次 Embed（会被 breaker 统计）。
