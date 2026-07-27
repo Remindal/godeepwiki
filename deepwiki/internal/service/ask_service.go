@@ -53,7 +53,7 @@ func (s *AskService) Ask(ctx context.Context, req dto.AskRequest) (*dto.AskRespo
 	}
 	references := buildReferences(hits)
 
-	prompt := buildAskPrompt(req.Question, hits)
+	prompt := buildAskPrompt(req.Question, hits, req.History)
 	resp, err := s.llm.Generate(ctx, model.ChatRequest{
 		Model:       s.llm.ModelName(),
 		Messages:    prompt,
@@ -99,7 +99,7 @@ func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink fun
 		return err
 	}
 
-	prompt := buildAskPrompt(req.Question, hits)
+	prompt := buildAskPrompt(req.Question, hits, req.History)
 	stream, err := s.llm.GenerateStream(ctx, model.ChatRequest{
 		Model:       s.llm.ModelName(),
 		Messages:    prompt,
@@ -218,7 +218,9 @@ func buildReferences(hits []model.ChunkHit) []dto.ReferenceDTO {
 	return refs
 }
 
-func buildAskPrompt(question string, hits []model.ChunkHit) []model.ChatMessage {
+// buildAskPrompt 组装 prompt：system 规则 → 多轮历史（可选，最近 6 轮，单条截断 500 runes）
+// → 当前代码片段 + 问题。检索仍只基于当前问题（query 重写留待后续）。
+func buildAskPrompt(question string, hits []model.ChunkHit, history []dto.ChatTurn) []model.ChatMessage {
 	system := `你是一个代码问答助手。你只能依据下面给出的代码片段回答问题。
 引用格式必须使用 [path:start-end]；禁止编造行号与文件路径。
 如果片段不足以回答，请回答“未在仓库中找到相关代码”。`
@@ -228,11 +230,21 @@ func buildAskPrompt(question string, hits []model.ChunkHit) []model.ChatMessage 
 		ctx.WriteString(fmt.Sprintf("\n--- %s:%d-%d ---\n%s\n", h.Chunk.Path, h.Chunk.StartLine, h.Chunk.EndLine, h.Chunk.Content))
 	}
 
-	user := fmt.Sprintf("代码片段：%s\n\n问题：%s", ctx.String(), question)
-	return []model.ChatMessage{
-		{Role: "system", Content: system},
-		{Role: "user", Content: user},
+	messages := []model.ChatMessage{{Role: "system", Content: system}}
+	// 只保留最近 6 轮，控制 prompt token 膨胀（每轮单条截断 500 runes）。
+	if len(history) > 6 {
+		history = history[len(history)-6:]
 	}
+	for _, turn := range history {
+		role := "user"
+		if turn.Role == "assistant" {
+			role = "assistant"
+		}
+		messages = append(messages, model.ChatMessage{Role: role, Content: truncateRunes(turn.Content, 500)})
+	}
+
+	user := fmt.Sprintf("代码片段：%s\n\n问题：%s", ctx.String(), question)
+	return append(messages, model.ChatMessage{Role: "user", Content: user})
 }
 
 func usageFromResponse(resp model.ChatResponse) dto.UsageDTO {

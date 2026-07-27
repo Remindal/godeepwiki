@@ -155,6 +155,12 @@ async function ask(question: string) {
   const q = question.trim()
   if (!q || streaming.value) return
   input.value = ''
+  // 多轮上下文：取最近 6 条已完成消息（不含本轮），随请求传给后端拼 prompt。
+  const history = messages.value
+    .filter((m) => !m.streaming)
+    .slice(-6)
+    .map((m) => ({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }))
+
   messages.value.push({ role: 'user', content: q })
   const ai: Msg = { role: 'ai', content: '', thinking: '', streaming: true, refsOpen: false }
   messages.value.push(ai)
@@ -164,7 +170,7 @@ async function ask(question: string) {
 
   const { abort: ab, done } = streamSSE(
     '/api/v1/ask/stream',
-    { method: 'POST', body: { repo_id: repoId, question: q, mode: mode.value, top_k: 8 } },
+    { method: 'POST', body: { repo_id: repoId, question: q, mode: mode.value, top_k: 8, history } },
     (frame) => {
       try {
         const payload = JSON.parse(frame.data)
