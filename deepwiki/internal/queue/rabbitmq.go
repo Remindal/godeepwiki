@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
@@ -53,6 +54,7 @@ type TaskMessage struct {
 type Conn struct {
 	mu          sync.Mutex
 	conn        *amqp.Connection
+	broken      atomic.Bool // 半死标记（confirm 超时后由 publisher 置位）
 	url         string
 	logger      *zap.Logger
 	queueMaxLen int // x-max-length = worker.queue_size（默认 100）
@@ -70,12 +72,13 @@ func Dial(ctx context.Context, url string, queueMaxLen int, logger *zap.Logger) 
 	return &Conn{conn: conn, url: url, queueMaxLen: queueMaxLen, logger: logger}, nil
 }
 
-// EnsureConnection 断线重连：连接已关闭时按原 url 重拨（broker 侧持久拓扑无需重声明）。
-// consumer 监督循环在消费 channel 断开时调用（总纲 §4.3 重试语义）。
+// EnsureConnection 断线重连：连接已关闭或被标记半死时按原 url 重拨
+//（broker 侧持久拓扑无需重声明；被替换的旧连接直接遗弃，由 broker 心跳超时回收，
+// 禁止走 amqp091 的 Close——其 shutdown 内部 close-ok 等待在半死连接上会永久阻塞）。
 func (c *Conn) EnsureConnection(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.conn != nil && !c.conn.IsClosed() {
+	if c.conn != nil && !c.conn.IsClosed() && !c.broken.Load() {
 		return nil
 	}
 	conn, err := amqp.Dial(c.url)
@@ -83,6 +86,7 @@ func (c *Conn) EnsureConnection(ctx context.Context) error {
 		return fmt.Errorf("rabbitmq redial: %w", err)
 	}
 	c.conn = conn
+	c.broken.Store(false)
 	c.logger.Warn("rabbitmq reconnected")
 	return nil
 }
@@ -156,13 +160,11 @@ func (c *Conn) DeclareTopology(ctx context.Context) error {
 	return nil
 }
 
-// ForceClose 强制断开当前连接（半死连接上 confirm 超时后调用，下次使用经 EnsureConnection 重拨）。
+// ForceClose 标记连接半死（非阻塞）：仅置位，不做任何 RPC；
+// 下次 EnsureConnection 据此换新连接。amqp091 的 Close/CloseDeadline 在半死连接上会
+// 卡死在 shutdown 的 sync.Once（close-ok 永等不到），曾引发启动死锁。
 func (c *Conn) ForceClose() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != nil && !c.conn.IsClosed() {
-		_ = c.conn.Close()
-	}
+	c.broken.Store(true)
 }
 
 // Channel 新建 channel（publisher/consumer 各自持独立 channel，禁止跨 goroutine 共享，amqp091-go 线程安全约束）。
