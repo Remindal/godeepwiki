@@ -156,6 +156,15 @@ func (c *Conn) DeclareTopology(ctx context.Context) error {
 	return nil
 }
 
+// ForceClose 强制断开当前连接（半死连接上 confirm 超时后调用，下次使用经 EnsureConnection 重拨）。
+func (c *Conn) ForceClose() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil && !c.conn.IsClosed() {
+		_ = c.conn.Close()
+	}
+}
+
 // Channel 新建 channel（publisher/consumer 各自持独立 channel，禁止跨 goroutine 共享，amqp091-go 线程安全约束）。
 func (c *Conn) Channel() (*amqp.Channel, error) {
 	c.mu.Lock()

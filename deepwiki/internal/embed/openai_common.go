@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -44,6 +45,26 @@ func embedWithOpenAI(
 		return nil, nil
 	}
 	texts = clampEmbeddingInputs(texts, maxRunes, logger)
+	vecs, err := embedBatches(ctx, client, modelName, dims, batchSize, breaker, logger, texts)
+	if err != nil && maxRunes > 0 && strings.Contains(err.Error(), "400") {
+		// 混合内容（emoji/稀有字符）的 token 密度可能超 rune 估算，400 时降档重试一次。
+		logger.Warn("embedding 400, retry with half rune cap", zap.Int("from_runes", maxRunes))
+		vecs, err = embedBatches(ctx, client, modelName, dims, batchSize, breaker, logger,
+			clampEmbeddingInputs(texts, maxRunes/2, logger))
+	}
+	return vecs, err
+}
+
+func embedBatches(
+	ctx context.Context,
+	client openai.Client,
+	modelName string,
+	dims *int,
+	batchSize int,
+	breaker *gobreaker.CircuitBreaker[any],
+	logger *zap.Logger,
+	texts []string,
+) ([][]float32, error) {
 	if batchSize <= 0 {
 		batchSize = 64
 	}

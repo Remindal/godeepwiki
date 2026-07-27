@@ -59,6 +59,10 @@ func (p *amqpPublisher) ensureChannel() (*amqp.Channel, error) {
 	if p.ch != nil && !p.ch.IsClosed() {
 		return p.ch, nil
 	}
+	// 连接可能半死/已断：先确保连接存活（断开自动重拨），再开 confirm channel。
+	if err := p.conn.EnsureConnection(context.Background()); err != nil {
+		return nil, err
+	}
 	ch, err := p.conn.Channel()
 	if err != nil {
 		return nil, err
@@ -69,6 +73,15 @@ func (p *amqpPublisher) ensureChannel() (*amqp.Channel, error) {
 	}
 	p.ch = ch
 	return ch, nil
+}
+
+// resetLocked 投递失败后重置：关 channel + 强断连接（下次投递自动重拨重建）。
+func (p *amqpPublisher) resetLocked() {
+	if p.ch != nil {
+		_ = p.ch.Close()
+		p.ch = nil
+	}
+	p.conn.ForceClose()
 }
 
 func (p *amqpPublisher) Publish(ctx context.Context, msg TaskMessage) error {
@@ -106,6 +119,7 @@ func (p *amqpPublisher) Publish(ctx context.Context, msg TaskMessage) error {
 	case conf, ok := <-confirms:
 		if !ok {
 			observability.IncRabbitMQPublishConfirm("fail")
+			p.resetLocked()
 			return ErrPublishFailed
 		}
 		if conf.Ack {
@@ -113,13 +127,16 @@ func (p *amqpPublisher) Publish(ctx context.Context, msg TaskMessage) error {
 			return nil
 		}
 		observability.IncRabbitMQPublishConfirm("fail")
+		p.resetLocked()
 		return ErrPublishFailed
 	case ret := <-returns:
 		p.logger.Warn("rabbitmq message returned", zap.Uint16("replyCode", ret.ReplyCode), zap.String("replyText", ret.ReplyText))
 		observability.IncRabbitMQPublishConfirm("fail")
 		return ErrPublishFailed
 	case <-ctx.Done():
+		// confirm 超时：典型半死连接，重置后下次投递自动重拨（用户不再吃到持续的 50302）。
 		observability.IncRabbitMQPublishConfirm("fail")
+		p.resetLocked()
 		return ErrPublishFailed
 	}
 }
@@ -167,12 +184,14 @@ func (p *amqpPublisher) publishTo(ctx context.Context, exchange, routingKey stri
 	case conf, ok := <-confirms:
 		if !ok || !conf.Ack {
 			observability.IncRabbitMQPublishConfirm("fail")
+			p.resetLocked()
 			return ErrPublishFailed
 		}
 		observability.IncRabbitMQPublishConfirm("ok")
 		return nil
 	case <-ctx.Done():
 		observability.IncRabbitMQPublishConfirm("fail")
+		p.resetLocked()
 		return ErrPublishFailed
 	}
 }

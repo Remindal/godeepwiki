@@ -16,18 +16,19 @@ import (
 	"go.uber.org/zap"
 )
 
-// tarballMirrors tarball 降级下载源（git clone 受 GFW 指纹封锁/代理不稳定时的兜底）。
-// Go net/http 的 TLS 指纹目前可直连 codeload；镜像源覆盖国内 CDN，按序尝试。
-var tarballMirrors = []string{
+// tarballMirrorTpls 指定分支时的 tarball 下载源模板（git clone 受 GFW 指纹封锁/代理不稳定时的兜底）。
+var tarballMirrorTpls = []string{
 	"https://codeload.github.com/{owner}/{repo}/tar.gz/refs/heads/{branch}",
 	"https://mirror.ghproxy.com/https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.tar.gz",
+	"https://ghfast.top/https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.tar.gz",
 	"https://gh-proxy.com/https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.tar.gz",
 }
 
 var githubURLRe = regexp.MustCompile(`^https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$`)
 
 // cloneViaTarball tarball 降级克隆：HTTP 下载 tar.gz → 解压到 destDir（剥掉顶层目录）。
-// 注意：不产生 .git 元数据——ingest pipeline（ParseFiles/ChunkFiles）不依赖 git 历史；
+// 分支留空时用 codeload 的 tar.gz/HEAD（自动解析默认分支），并按 master/main 候选重试镜像。
+// 注意：不产生 .git 元数据——ingest pipeline 不依赖 git 历史；
 // 但 refresh 的 FetchAndReset 需要真实 git 仓库，tarball 摄取的仓库 refresh 会在 fetching 阶段失败（dev 取舍）。
 func (c *GitCloner) cloneViaTarball(ctx context.Context, url, branch, destDir string) error {
 	m := githubURLRe.FindStringSubmatch(url)
@@ -35,14 +36,22 @@ func (c *GitCloner) cloneViaTarball(ctx context.Context, url, branch, destDir st
 		return fmt.Errorf("not a github url: %s", url)
 	}
 	owner, repo := m[1], m[2]
-	if branch == "" {
-		branch = "HEAD"
+
+	var candidates []string
+	if branch != "" {
+		candidates = mirrorURLs(owner, repo, branch)
+	} else {
+		// 未指定分支：先用能解析默认分支的端点（refs/heads/HEAD 不是合法 ref，会 404），
+		// 再按常见默认分支名重试镜像。
+		candidates = append(candidates, fmt.Sprintf("https://codeload.github.com/%s/%s/tar.gz/HEAD", owner, repo))
+		for _, b := range []string{"master", "main"} {
+			candidates = append(candidates, mirrorURLs(owner, repo, b)...)
+		}
 	}
 
 	client := &http.Client{Timeout: 5 * time.Minute} // Transport 默认遵循 HTTP(S)_PROXY 环境变量
 	var lastErr error
-	for _, tpl := range tarballMirrors {
-		u := strings.NewReplacer("{owner}", owner, "{repo}", repo, "{branch}", branch).Replace(tpl)
+	for _, u := range candidates {
 		err := downloadAndExtract(ctx, client, u, destDir)
 		if err == nil {
 			c.logger.Info("tarball fallback clone succeeded", zap.String("url", u), zap.String("dest", destDir))
@@ -52,6 +61,14 @@ func (c *GitCloner) cloneViaTarball(ctx context.Context, url, branch, destDir st
 		c.logger.Warn("tarball mirror failed", zap.String("url", u), zap.Error(err))
 	}
 	return fmt.Errorf("all tarball mirrors failed: %w", lastErr)
+}
+
+func mirrorURLs(owner, repo, branch string) []string {
+	out := make([]string, 0, len(tarballMirrorTpls))
+	for _, tpl := range tarballMirrorTpls {
+		out = append(out, strings.NewReplacer("{owner}", owner, "{repo}", repo, "{branch}", branch).Replace(tpl))
+	}
+	return out
 }
 
 // downloadAndExtract 下载 tar.gz 并解压到 destDir（剥掉第一层目录 <repo>-<ref>/）。
