@@ -55,13 +55,14 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, ApiError } from '../api/client'
 import type { PageResult, Repo, TaskSubmitted } from '../api/types'
 
 const router = useRouter()
+const route = useRoute()
 const repos = ref<Repo[]>([])
 const loading = ref(true)
 const ingestVisible = ref(false)
@@ -136,6 +137,18 @@ async function remove(r: Repo) {
 }
 
 onMounted(load)
+
+// 侧栏「＋ 摄取仓库」带 ?ingest=1 跳转时自动弹出摄取对话框。
+watch(
+  () => route.query.ingest,
+  (v) => {
+    if (v) {
+      ingestVisible.value = true
+      router.replace({ query: {} })
+    }
+  },
+  { immediate: true },
+)
 </script>
 
 <style scoped>

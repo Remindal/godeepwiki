@@ -6,8 +6,8 @@
         <span class="brand-name">DeepWiki</span>
       </div>
 
-      <button class="new-chat-btn" @click="$router.push('/')">
-        <span>＋</span> 仓库列表
+      <button class="new-chat-btn" @click="$router.push({ path: '/', query: { ingest: '1' } })">
+        <span>＋</span> 摄取仓库
       </button>
 
       <nav class="nav">
