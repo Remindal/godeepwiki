@@ -178,25 +178,47 @@ func (p *amqpPublisher) publishTo(ctx context.Context, exchange, routingKey stri
 }
 
 func (p *amqpPublisher) QueueDepth(ctx context.Context) (int, error) {
-	ch, err := p.conn.Channel()
-	if err != nil {
-		return 0, err
+	// QueueDeclarePassive 是同步 AMQP RPC 且不接受 ctx；半死连接上会永久阻塞
+	// （曾导致 health/Submit 挂死）。放独立 goroutine 执行并加 3s 超时兜底。
+	type depthResult struct {
+		n   int
+		err error
 	}
-	defer ch.Close()
-
-	q, err := ch.QueueDeclarePassive(QueueJobs, true, false, false, false, nil)
-	if err != nil {
-		var amqpErr *amqp.Error
-		if errors.As(err, &amqpErr) && amqpErr.Code == 404 {
-			// 队列为声明失败：触发拓扑重声明并按 0 处理，避免健康检查因瞬时缺失而 500。
-			if topoErr := p.conn.DeclareTopology(ctx); topoErr != nil {
-				p.logger.Warn("rabbitmq topology redeclare failed", zap.Error(topoErr))
-			}
-			return 0, nil
+	resultCh := make(chan depthResult, 1)
+	go func() {
+		ch, err := p.conn.Channel()
+		if err != nil {
+			resultCh <- depthResult{0, err}
+			return
 		}
-		return 0, err
+		defer ch.Close()
+		q, err := ch.QueueDeclarePassive(QueueJobs, true, false, false, false, nil)
+		if err != nil {
+			resultCh <- depthResult{0, err}
+			return
+		}
+		resultCh <- depthResult{q.Messages, nil}
+	}()
+
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			var amqpErr *amqp.Error
+			if errors.As(r.err, &amqpErr) && amqpErr.Code == 404 {
+				// 队列未声明：触发拓扑重声明并按 0 处理，避免健康检查因瞬时缺失而 500。
+				if topoErr := p.conn.DeclareTopology(ctx); topoErr != nil {
+					p.logger.Warn("rabbitmq topology redeclare failed", zap.Error(topoErr))
+				}
+				return 0, nil
+			}
+			return 0, r.err
+		}
+		return r.n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-time.After(3 * time.Second):
+		return 0, fmt.Errorf("rabbitmq queue depth timeout")
 	}
-	return q.Messages, nil
 }
 
 func (p *amqpPublisher) Close() error {

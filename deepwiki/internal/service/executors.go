@@ -372,7 +372,11 @@ func (e *WikiExecutor) Execute(ctx context.Context, t *model.Task) error {
 
 	update := func(state model.TaskState, percent int) error {
 		progress := model.Progress{Current: percent, Total: 100, Percent: percent}
-		return e.tasks.UpdateState(ctx, t.TaskID, model.TaskPatch{State: ptrState(state), Progress: &progress})
+		if err := e.tasks.UpdateState(ctx, t.TaskID, model.TaskPatch{State: ptrState(state), Progress: &progress}); err != nil {
+			return err
+		}
+		publishStateEvent(ctx, e.bus, e.logger, t, state, progress, model.Stats{})
+		return nil
 	}
 
 	// outlining：用 LLM 生成 TOC。
@@ -437,7 +441,11 @@ func (e *WikiExecutor) Execute(ctx context.Context, t *model.Task) error {
 	completed := model.TaskStateCompleted
 	now := time.Now().UTC()
 	progress := model.Progress{Current: 100, Total: 100, Percent: 100}
-	return e.tasks.UpdateState(ctx, t.TaskID, model.TaskPatch{State: &completed, Progress: &progress, FinishedAt: &now})
+	if err := e.tasks.UpdateState(ctx, t.TaskID, model.TaskPatch{State: &completed, Progress: &progress, FinishedAt: &now}); err != nil {
+		return err
+	}
+	publishStateEvent(ctx, e.bus, e.logger, t, model.TaskStateCompleted, progress, model.Stats{})
+	return nil
 }
 
 func (e *WikiExecutor) generateTOC(ctx context.Context, repo *model.Repo, hits []model.ChunkHit) ([]store.WikiTOCItem, error) {
@@ -506,6 +514,35 @@ func defaultTOC() []store.WikiTOCItem {
 		{Slug: "overview", Title: "项目概览", SortOrder: 1},
 		{Slug: "architecture", Title: "架构设计", SortOrder: 2},
 		{Slug: "getting-started", Title: "快速开始", SortOrder: 3},
+	}
+}
+
+// stateChangedPayload task.state_changed 事件载荷（与 ingest.Pipeline 同一结构，payload 字段冻结）。
+type stateChangedPayload struct {
+	State    model.TaskState `json:"state"`
+	Progress model.Progress  `json:"progress"`
+	Stats    model.Stats     `json:"stats"`
+}
+
+// publishStateEvent 发布 task.state_changed 事件（失败仅 WARN，任务状态以 Postgres 为准）。
+func publishStateEvent(ctx context.Context, bus eventbus.EventBus, logger *zap.Logger, t *model.Task, state model.TaskState, progress model.Progress, stats model.Stats) {
+	if bus == nil {
+		return
+	}
+	payload, err := json.Marshal(stateChangedPayload{State: state, Progress: progress, Stats: stats})
+	if err != nil {
+		logger.Warn("marshal state_changed payload failed", zap.Error(err))
+		return
+	}
+	ev := model.Event{
+		Type:      model.EventTypeTaskStateChanged,
+		RepoID:    t.RepoID,
+		TaskID:    t.TaskID,
+		Timestamp: time.Now().UTC(),
+		Payload:   json.RawMessage(payload),
+	}
+	if err := bus.Publish(ctx, ev); err != nil {
+		logger.Warn("publish state_changed event failed", zap.String("task_id", t.TaskID), zap.Error(err))
 	}
 }
 
