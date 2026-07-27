@@ -119,6 +119,13 @@ func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink fun
 			return mapLLMError(chunk.Err)
 		}
 		if chunk.Delta != "" {
+			if chunk.Reasoning {
+				// 推理段走独立 thinking 事件（不进正式答案，前端折叠灰显）。
+				if err := sink("thinking", dto.StreamTokenEvent{Delta: chunk.Delta}); err != nil {
+					return err
+				}
+				continue
+			}
 			answer.WriteString(chunk.Delta)
 			if err := sink("token", dto.StreamTokenEvent{Delta: chunk.Delta}); err != nil {
 				return err

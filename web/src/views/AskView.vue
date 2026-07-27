@@ -20,7 +20,12 @@
           <div v-else class="msg-row">
             <div class="ai-avatar">DW</div>
             <div class="ai-body">
-              <div v-if="m.thinking" class="thinking dw-faint">{{ m.thinking }}</div>
+              <div v-if="m.thinking" class="thinking-wrap">
+                <div class="thinking-title dw-faint" @click="m.thinkingOpen = !m.thinkingOpen">
+                  {{ m.thinkingOpen ? '▾' : '▸' }} 思考过程{{ m.streaming && !m.content ? '（进行中…）' : '' }}
+                </div>
+                <div v-show="m.thinkingOpen" class="thinking-content dw-faint">{{ m.thinking }}</div>
+              </div>
               <div class="bubble ai-bubble" v-html="renderMd(m.content)"></div>
               <div v-if="m.streaming && !m.content" class="typing dw-faint">思考中…</div>
 
@@ -86,6 +91,7 @@ interface Msg {
   role: 'user' | 'ai'
   content: string
   thinking?: string
+  thinkingOpen?: boolean
   streaming?: boolean
   references?: Reference[]
   refsOpen?: boolean
@@ -176,8 +182,10 @@ async function ask(question: string) {
         const payload = JSON.parse(frame.data)
         if (frame.event === 'references') {
           ai.references = payload.references
+        } else if (frame.event === 'thinking') {
+          // thinking 模型推理段：独立折叠灰显（Kimi 风格），不计入正式答案
+          ai.thinking = (ai.thinking || '') + payload.delta
         } else if (frame.event === 'token') {
-          // thinking 模型的推理与正文统一流式展示；推理段落弱化显示
           ai.content += payload.delta
         } else if (frame.event === 'done') {
           ai.usage = payload.usage
@@ -253,7 +261,20 @@ onBeforeUnmount(() => abort?.())
   font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center;
 }
 .ai-body { flex: 1; min-width: 0; }
-.thinking { font-size: 12px; margin-bottom: 4px; }
+.thinking-wrap { margin-bottom: 6px; }
+.thinking-title { font-size: 12px; cursor: pointer; user-select: none; }
+.thinking-content {
+  font-size: 12px;
+  line-height: 1.7;
+  margin-top: 4px;
+  padding: 8px 10px;
+  background: var(--dw-bg-soft);
+  border-left: 2px solid var(--dw-border);
+  border-radius: 0 var(--dw-radius-sm) var(--dw-radius-sm) 0;
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow-y: auto;
+}
 .typing { font-size: 13px; }
 
 .refs { margin-top: 8px; }

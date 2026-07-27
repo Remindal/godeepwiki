@@ -139,11 +139,12 @@ func streamWithOpenAI(
 				sc.Delta = d.Content
 				if sc.Delta == "" {
 					// DeepSeek-V4 等 thinking 模型的推理阶段经 delta.reasoning_content 下发
-					//（openai-go 未建模该扩展字段，落 ExtraFields；不转发会让客户端长时间无 token）。
+					//（openai-go 未建模该扩展字段，落 ExtraFields）。标记 Reasoning 供前端折叠灰显。
 					if f, ok := d.JSON.ExtraFields["reasoning_content"]; ok && f.Valid() {
 						var rs string
 						if json.Unmarshal([]byte(f.Raw()), &rs) == nil {
 							sc.Delta = rs
+							sc.Reasoning = true
 						}
 					}
 				}

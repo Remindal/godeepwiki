@@ -30,6 +30,7 @@ type ChatResponse struct {
 // StreamChunk 流式输出元素；消费方必须先检查 Err。
 type StreamChunk struct {
 	Delta        string  // 增量文本
+	Reasoning    bool    // true = thinking 模型推理段（reasoning_content），前端折叠灰显
 	FinishReason string  // 非空表示结束原因
 	Usage        *Usage  // 仅结束 chunk 可能携带（provider 支持时）
 	Err          error   // 非 nil 表示流内错误，此后 channel 将被关闭
