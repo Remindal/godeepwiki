@@ -67,7 +67,11 @@ async function generate() {
     ElMessage.success(`生成任务已提交：${res.task_id}，完成后回到本页查看`)
     setTimeout(load, 15000)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '提交失败')
+    if (e instanceof ApiError && e.code === 40902) {
+      ElMessage.warning(e.message) // "wiki 正在生成中，请等待完成"
+    } else {
+      ElMessage.error(e instanceof Error ? e.message : '提交失败')
+    }
     generating.value = false
   }
 }

@@ -40,6 +40,16 @@ func (s *WikiService) Generate(ctx context.Context, repoID string) (*model.Task,
 		return nil, model.NewAPIError(model.CodeInvalidTaskState, "repo is not ready")
 	}
 
+	// 生成中互斥：该仓库存在非终态任务（wiki/ingest/refresh）时拒绝重复提交，
+	// 避免同一仓库的 wiki 任务重复排队（用户期望提示"正在生成"）。
+	if tasks, _, err := s.tm.List(ctx, model.TaskFilter{RepoID: repoID, Page: 1, PageSize: 100}); err == nil {
+		for _, t := range tasks {
+			if !t.State.IsTerminal() {
+				return nil, model.NewAPIError(model.CodeInvalidTaskState, "wiki 正在生成中，请等待完成")
+			}
+		}
+	}
+
 	t := &model.Task{
 		TaskID:    newID("tsk_"),
 		Type:      model.TaskTypeWiki,
