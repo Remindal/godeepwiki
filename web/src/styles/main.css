@@ -1,0 +1,61 @@
+/* DeepWiki 设计基调：Kimi 网页版风 —— 黑白极简 + iOS 大圆角 */
+:root {
+  --dw-bg: #ffffff;
+  --dw-bg-soft: #f7f7f8;
+  --dw-bg-mute: #f0f0f2;
+  --dw-text: #1a1a1a;
+  --dw-text-2: #6b6b6f;
+  --dw-text-3: #a0a0a5;
+  --dw-border: #e8e8ea;
+  --dw-black: #1a1a1a;
+  --dw-white: #ffffff;
+  --dw-radius-lg: 20px;
+  --dw-radius-md: 14px;
+  --dw-radius-sm: 10px;
+  --dw-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 4px 16px rgba(0, 0, 0, 0.04);
+  --dw-shadow-hover: 0 2px 6px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Helvetica Neue", "Microsoft YaHei", sans-serif;
+  background: var(--dw-bg);
+  color: var(--dw-text);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 滚动条细线化 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--dw-border); border-radius: 3px; }
+
+/* Element Plus 主题收敛到黑白 */
+.el-button--primary {
+  --el-button-bg-color: var(--dw-black);
+  --el-button-border-color: var(--dw-black);
+  --el-button-hover-bg-color: #333;
+  --el-button-hover-border-color: #333;
+  --el-button-active-bg-color: #000;
+  --el-button-active-border-color: #000;
+}
+.el-button { border-radius: var(--dw-radius-sm); font-weight: 500; }
+.el-dialog { border-radius: var(--dw-radius-lg); }
+.el-card { border-radius: var(--dw-radius-md); border-color: var(--dw-border); }
+.el-input__wrapper { border-radius: var(--dw-radius-sm); }
+.el-tag { border-radius: 6px; }
+.el-progress-bar__outer { border-radius: 10px; }
+.el-table { --el-table-border-color: var(--dw-border); }
+
+/* 通用工具类 */
+.dw-card {
+  background: var(--dw-white);
+  border: 1px solid var(--dw-border);
+  border-radius: var(--dw-radius-lg);
+  box-shadow: var(--dw-shadow);
+}
+.dw-muted { color: var(--dw-text-2); }
+.dw-faint { color: var(--dw-text-3); }
