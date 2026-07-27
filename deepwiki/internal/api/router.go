@@ -2,6 +2,7 @@
 package api
 
 import (
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -96,5 +97,24 @@ func NewRouter(d Deps) *gin.Engine {
 
 	// 2. Prometheus 指标（不带版本前缀，免鉴权，§5.1）。
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	// 3. 前端静态托管（长期使用形态：web/dist 经卷挂载进容器；目录不存在则跳过，
+	// 开发态继续用 vite dev server，互不影响）。
+	if dist := webDistDir(); dist != "" {
+		r.NoRoute(staticSPA(dist))
+		d.Logger.Info("frontend static hosting enabled", zap.String("dist", dist))
+	}
 	return r
+}
+
+// webDistDir 前端构建产物目录：env DEEPWIKI_WEB_DIST 覆盖，默认 ./web/dist；不存在返回空。
+func webDistDir() string {
+	dir := os.Getenv("DEEPWIKI_WEB_DIST")
+	if dir == "" {
+		dir = "./web/dist"
+	}
+	if st, err := os.Stat(dir); err == nil && st.IsDir() {
+		return dir
+	}
+	return ""
 }
