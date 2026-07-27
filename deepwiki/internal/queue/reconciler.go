@@ -15,6 +15,9 @@ import (
 type RecoveryStore interface {
 	// FindInterrupted 查出全部非终态任务（state NOT IN ('completed','failed','cancelled')）。
 	FindInterrupted(ctx context.Context) ([]*model.Task, error)
+	// FindStale 查出 updated_at 早于 staleBefore 的非终态任务（周期重投用，
+	// 防止活跃任务被每分钟重复投递造成队列堆积）。
+	FindStale(ctx context.Context, staleBefore time.Time) ([]*model.Task, error)
 	// ResetStaleRunning running 态且 updated_at 早于 staleBefore（默认 now-5min，无心跳）
 	// → 重置为 pending（幂等 CAS：WHERE state NOT IN 终态，硬约束 #18），返回重置行数。
 	ResetStaleRunning(ctx context.Context, staleBefore time.Time) (int64, error)
@@ -55,12 +58,39 @@ func (r *Reconciler) StartPeriodic(ctx context.Context, interval time.Duration) 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := r.Recover(ctx); err != nil {
+				if err := r.RecoverStale(ctx); err != nil {
 					r.logger.Error("reconciler periodic recover failed", zap.Error(err))
 				}
 			}
 		}
 	}()
+}
+
+// RecoverStale 周期恢复（轻量）：只处理 updated_at 早于 staleAfter 的非终态任务——
+// 僵死 running 重置 pending 并重投；pending 且超 staleAfter 未消费的（消息可能丢失）重投一次。
+// 与启动 Recover（全量重投）区分，避免活跃任务被每分钟重复投递。
+func (r *Reconciler) RecoverStale(ctx context.Context) error {
+	staleBefore := time.Now().UTC().Add(-r.staleAfter)
+	reset, err := r.store.ResetStaleRunning(ctx, staleBefore)
+	if err != nil {
+		return fmt.Errorf("reconciler reset stale running: %w", err)
+	}
+	stale, err := r.store.FindStale(ctx, staleBefore)
+	if err != nil {
+		return fmt.Errorf("reconciler find stale: %w", err)
+	}
+	republished := 0
+	for _, t := range stale {
+		if err := r.pub.Publish(ctx, TaskMessage{TaskID: t.TaskID, Type: string(t.Type)}); err != nil {
+			r.logger.Error("reconciler republish failed", zap.String("task_id", t.TaskID), zap.Error(err))
+			continue
+		}
+		republished++
+	}
+	if reset > 0 || republished > 0 {
+		r.logger.Info("reconciler stale recovered", zap.Int64("reset_stale", reset), zap.Int("republished", republished))
+	}
+	return nil
 }
 
 // Recover 执行一次启动恢复（main 在 worker pool 启动前调用）。

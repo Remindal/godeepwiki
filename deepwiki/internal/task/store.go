@@ -295,6 +295,31 @@ ORDER BY created_at ASC`
 	return tasks, nil
 }
 
+// FindStale 周期恢复用：查出 updated_at 早于 staleBefore 的非终态任务（queue.RecoveryStore 契约）。
+func (s *postgresTaskStore) FindStale(ctx context.Context, staleBefore time.Time) ([]*model.Task, error) {
+	sql := `SELECT ` + taskColumns + ` FROM tasks
+WHERE state NOT IN ('completed','failed','cancelled') AND updated_at < $1
+ORDER BY created_at ASC`
+	rows, err := s.pool.Query(ctx, sql, staleBefore)
+	if err != nil {
+		return nil, fmt.Errorf("find stale: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []*model.Task
+	for rows.Next() {
+		t, err := s.scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stale: %w", err)
+	}
+	return tasks, nil
+}
+
 // ResetStaleRunning 启动恢复扩展（queue.RecoveryStore 契约）：running 态且 updated_at 早于
 // staleBefore（默认 5 分钟无心跳）→ 重置 pending（幂等 CAS：WHERE state NOT IN 终态，硬约束 #18）。
 func (s *postgresTaskStore) ResetStaleRunning(ctx context.Context, staleBefore time.Time) (int64, error) {
