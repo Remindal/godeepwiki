@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 
@@ -134,7 +135,18 @@ func streamWithOpenAI(
 			chunk := stream.Current()
 			sc := model.StreamChunk{}
 			if len(chunk.Choices) > 0 {
-				sc.Delta = chunk.Choices[0].Delta.Content
+				d := chunk.Choices[0].Delta
+				sc.Delta = d.Content
+				if sc.Delta == "" {
+					// DeepSeek-V4 等 thinking 模型的推理阶段经 delta.reasoning_content 下发
+					//（openai-go 未建模该扩展字段，落 ExtraFields；不转发会让客户端长时间无 token）。
+					if f, ok := d.JSON.ExtraFields["reasoning_content"]; ok && f.Valid() {
+						var rs string
+						if json.Unmarshal([]byte(f.Raw()), &rs) == nil {
+							sc.Delta = rs
+						}
+					}
+				}
 				sc.FinishReason = chunk.Choices[0].FinishReason
 			}
 			if chunk.Usage.JSON.TotalTokens.Valid() {
