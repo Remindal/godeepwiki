@@ -88,15 +88,16 @@ import { marked } from 'marked'
 import { ask, clearChat, getChat, type ChatMsg } from '../stores/chat'
 
 const route = useRoute()
-const repoId = route.params.repoId as string
 const input = ref('')
 const mode = ref('hybrid')
 const scrollEl = ref<HTMLElement>()
 
+// repoId 跟随路由参数响应式变化（/ask/A → /ask/B 组件复用时 setup 不重跑）。
+const repoId = computed(() => route.params.repoId as string)
 // 会话来自模块级仓库：离开页面流式在后台续跑，回来接着看（市面 AI 对话行为）。
-const chat = getChat(repoId)
-const messages = computed(() => chat.messages)
-const streaming = computed(() => chat.streaming)
+const chat = computed(() => getChat(repoId.value))
+const messages = computed(() => chat.value.messages)
+const streaming = computed(() => chat.value.streaming)
 
 const hints = ['这个仓库是干什么的？', '核心入口函数在哪里？', '路由是怎么注册和匹配的？']
 
@@ -128,11 +129,11 @@ function submit(question: string) {
   if (!q || streaming.value) return
   input.value = ''
   // fire-and-forget：组件只负责发起与滚动，生命周期不影响后台续跑。
-  void ask(repoId, q, mode.value, scrollBottom)
+  void ask(repoId.value, q, mode.value, scrollBottom)
 }
 
 function clearHistory() {
-  clearChat(repoId)
+  clearChat(repoId.value)
 }
 </script>
 
