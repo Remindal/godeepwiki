@@ -84,13 +84,51 @@ async function cancel(t: Task) {
   }
 }
 
+// WebSocket 实时推送（替代轮询）：事件到达即刷新（去抖 500ms）；断线 3s 重连并带
+// resume_from 回放漏掉的事件。WS 未就绪期间保留 3s 轮询兜底。
+let ws: WebSocket | undefined
+let lastSeq = 0
+let wsOpen = false
+let debounce: number | undefined
+
+function debouncedLoad() {
+  clearTimeout(debounce)
+  debounce = window.setTimeout(() => load(), 500)
+}
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const url = `${proto}://${location.host}/api/v1/ws?resume_from=${lastSeq}`
+  ws = new WebSocket(url)
+  ws.onopen = () => {
+    wsOpen = true
+  }
+  ws.onmessage = (e) => {
+    try {
+      const frame = JSON.parse(e.data) as { seq: number; type: string }
+      if (frame.seq) lastSeq = frame.seq
+      debouncedLoad()
+    } catch { /* 忽略非 JSON 帧 */ }
+  }
+  ws.onclose = () => {
+    wsOpen = false
+    window.setTimeout(connectWS, 3000)
+  }
+  ws.onerror = () => ws?.close()
+}
+
 onMounted(() => {
   load()
+  connectWS()
   timer = window.setInterval(() => {
-    if (tasks.value.some((t) => !isTerminal(t.state))) load()
+    // WS 断开期间的兜底轮询；WS 正常时事件驱动即可。
+    if (!wsOpen && tasks.value.some((t) => !isTerminal(t.state))) load()
   }, 3000)
 })
-onBeforeUnmount(() => clearInterval(timer))
+onBeforeUnmount(() => {
+  clearInterval(timer)
+  ws?.close()
+})
 </script>
 
 <style scoped>

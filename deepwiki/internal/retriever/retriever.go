@@ -12,3 +12,9 @@ type Retriever interface {
 	Search(ctx context.Context, repoID string, query string, topK int) ([]model.ChunkHit, error)
 	Mode() string // keyword|embedding|hybrid
 }
+
+// FilterSearcher 路径前缀过滤检索（进阶 path_filter）：不进入冻结接口，
+// 由各实现与装饰器满足，AskService 按需类型断言调用。
+type FilterSearcher interface {
+	SearchWithFilter(ctx context.Context, repoID string, query string, topK int, pathFilter string) ([]model.ChunkHit, error)
+}

@@ -34,6 +34,11 @@ func (r *VectorRetriever) Mode() string { return "embedding" }
 
 // Search query 向量化后走 pgvector；embedding 失败映射 50202 embedding_unavailable。
 func (r *VectorRetriever) Search(ctx context.Context, repoID string, query string, topK int) ([]model.ChunkHit, error) {
+	return r.SearchWithFilter(ctx, repoID, query, topK, "")
+}
+
+// SearchWithFilter 带路径前缀过滤的向量检索（进阶 path_filter，FilterSearcher 契约）。
+func (r *VectorRetriever) SearchWithFilter(ctx context.Context, repoID string, query string, topK int, pathFilter string) ([]model.ChunkHit, error) {
 	vectors, err := r.emb.Embed(ctx, []string{query})
 	if err != nil {
 		return nil, &model.APIError{Code: model.CodeEmbeddingUnavailable, Message: model.MessageOf(model.CodeEmbeddingUnavailable), Err: err}
@@ -41,7 +46,7 @@ func (r *VectorRetriever) Search(ctx context.Context, repoID string, query strin
 	if len(vectors) == 0 {
 		return nil, &model.APIError{Code: model.CodeEmbeddingUnavailable, Message: model.MessageOf(model.CodeEmbeddingUnavailable), Err: fmt.Errorf("embedder returned no vector")}
 	}
-	return r.SearchByVector(ctx, repoID, vectors[0], topK, "")
+	return r.SearchByVector(ctx, repoID, vectors[0], topK, pathFilter)
 }
 
 // SearchByVector pgvector HNSW 余弦检索（变更总纲 §4.1 检索 SQL 唯一实现处）。

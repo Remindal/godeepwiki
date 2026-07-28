@@ -39,10 +39,21 @@ func (r *RerankRetriever) Mode() string { return r.inner.Mode() }
 
 // Search 取 topK*4 候选 → 重排 → 截断 topK；重排失败降级为 inner 原序结果并记 WARN，不整体失败。
 func (r *RerankRetriever) Search(ctx context.Context, repoID string, query string, topK int) ([]model.ChunkHit, error) {
+	return r.SearchWithFilter(ctx, repoID, query, topK, "")
+}
+
+// SearchWithFilter 带路径过滤的重排检索（FilterSearcher 契约；inner 不支持过滤时直通）。
+func (r *RerankRetriever) SearchWithFilter(ctx context.Context, repoID string, query string, topK int, pathFilter string) ([]model.ChunkHit, error) {
 	if topK <= 0 {
 		topK = 10
 	}
-	candidates, err := r.inner.Search(ctx, repoID, query, topK*4)
+	var candidates []model.ChunkHit
+	var err error
+	if fs, ok := r.inner.(FilterSearcher); ok {
+		candidates, err = fs.SearchWithFilter(ctx, repoID, query, topK*4, pathFilter)
+	} else {
+		candidates, err = r.inner.Search(ctx, repoID, query, topK*4)
+	}
 	if err != nil {
 		return nil, err
 	}

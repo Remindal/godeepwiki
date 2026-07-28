@@ -123,7 +123,10 @@ func (h *AskHandler) AskStream(c *gin.Context) {
 
 func validateAskRequest(req dto.AskRequest) []model.ErrorDetail {
 	var details []model.ErrorDetail
-	if !validRepoID(req.RepoID) {
+	// repo_id 与 repo_url 二选一；repo_id 非空时校验格式。
+	if req.RepoID == "" && req.RepoURL == "" {
+		details = append(details, model.ErrorDetail{Field: "repo_id", Issue: "repo_id or repo_url is required"})
+	} else if req.RepoID != "" && !validRepoID(req.RepoID) {
 		details = append(details, invalidRepoIDDetail("repo_id")...)
 	}
 	if req.Question == "" || len(req.Question) > 4000 {

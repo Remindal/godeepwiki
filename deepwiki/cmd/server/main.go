@@ -177,7 +177,7 @@ func main() {
 	wikiStore := store.NewWikiStore(db, logger)
 	vectorStore := store.NewVectorStore(db, cfg.Storage.Vector.EFSearch, logger)
 	cloner := ingest.NewGitCloner(cfg.Git.BinaryPath, cfg.Git.OpTimeout, logger)
-	retrievers := buildRetrievers(searchCli, chunkStore, vectorStore, pool, emb, cfg, logger)
+	retrievers := buildRetrievers(searchCli, chunkStore, vectorStore, pool, emb, llmClient, cfg, logger)
 
 	ingestSvc := service.NewIngestService(tm, repoStore, cloner, publisher, cm, logger)
 	repoSvc := service.NewRepoService(repoStore, chunkStore, vectorStore, wikiStore, searchCli, tm, logger)
@@ -455,11 +455,17 @@ func breakerStateOf(provider any) string {
 }
 
 // buildRetrievers 检索三件套装配（keyword=OpenSearch BM25、embedding=pgvector HNSW、hybrid=RRF 融合）。
-func buildRetrievers(searchCli *search.Client, chunks store.ChunkStore, vectors store.VectorStore, pool *pgxpool.Pool, emb embed.Embedder, cfg *config.Config, logger *zap.Logger) map[string]retriever.Retriever {
+// 全部经 RerankRetriever 装饰：粗筛 topK*4 → LLM 重排 → 截断 topK（重排失败自动降级原序）。
+func buildRetrievers(searchCli *search.Client, chunks store.ChunkStore, vectors store.VectorStore, pool *pgxpool.Pool, emb embed.Embedder, llmClient llm.LLM, cfg *config.Config, logger *zap.Logger) map[string]retriever.Retriever {
 	kw := retriever.NewKeywordRetriever(searchCli, chunks, logger)
 	vec := retriever.NewVectorRetriever(pool, emb, cfg.Storage.Vector.EFSearch, logger)
 	hyb := retriever.NewHybridRetriever(kw, vec, cfg.Retriever.RRFK, logger)
-	return map[string]retriever.Retriever{"keyword": kw, "embedding": vec, "hybrid": hyb}
+	reranker := retriever.NewLLMReranker(llmClient)
+	return map[string]retriever.Retriever{
+		"keyword":   retriever.NewRerankRetriever(kw, logger).WithReranker(reranker),
+		"embedding": retriever.NewRerankRetriever(vec, logger).WithReranker(reranker),
+		"hybrid":    retriever.NewRerankRetriever(hyb, logger).WithReranker(reranker),
+	}
 }
 
 // verifyIndices 启动一致性校验（总纲 §4.2）：每仓 count(index) == chunks 表行数，

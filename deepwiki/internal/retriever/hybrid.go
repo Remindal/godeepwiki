@@ -32,6 +32,15 @@ func (r *HybridRetriever) Mode() string { return "hybrid" }
 // score = Σ 1/(rrfK + rank)，rank 从 1 起；按 chunk_id 合并取最高 RRF 分，降序截断 topK。
 // 任一路失败降级为另一路结果并记 WARN，不整体失败；两路均失败才返回错误。
 func (r *HybridRetriever) Search(ctx context.Context, repoID string, query string, topK int) ([]model.ChunkHit, error) {
+	return r.search(ctx, repoID, query, topK, "")
+}
+
+// SearchWithFilter 带路径前缀过滤的混合检索（FilterSearcher 契约，两路均带过滤）。
+func (r *HybridRetriever) SearchWithFilter(ctx context.Context, repoID string, query string, topK int, pathFilter string) ([]model.ChunkHit, error) {
+	return r.search(ctx, repoID, query, topK, pathFilter)
+}
+
+func (r *HybridRetriever) search(ctx context.Context, repoID string, query string, topK int, pathFilter string) ([]model.ChunkHit, error) {
 	if topK <= 0 {
 		topK = 10
 	}
@@ -51,10 +60,10 @@ func (r *HybridRetriever) Search(ctx context.Context, repoID string, query strin
 	kwCh := make(chan result, 1)
 	vecCh := make(chan result, 1)
 	go func() {
-		kwCh <- run(func() ([]model.ChunkHit, error) { return r.keyword.Search(ctx, repoID, query, topK) })
+		kwCh <- run(func() ([]model.ChunkHit, error) { return r.keyword.SearchWithPath(ctx, repoID, query, topK, pathFilter) })
 	}()
 	go func() {
-		vecCh <- run(func() ([]model.ChunkHit, error) { return r.vector.Search(ctx, repoID, query, topK) })
+		vecCh <- run(func() ([]model.ChunkHit, error) { return r.vector.SearchWithFilter(ctx, repoID, query, topK, pathFilter) })
 	}()
 	kw, vec := <-kwCh, <-vecCh
 

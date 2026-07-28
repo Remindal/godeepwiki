@@ -8,12 +8,16 @@ type ChatTurn struct {
 
 // AskRequest POST /api/v1/ask 与 /ask/stream 共用请求体（§6.2）。
 // History 可选：多轮上下文（前端传最近 N 轮，后端按序拼入 prompt；缺省 = 单轮无状态）。
+// RepoID 与 RepoURL 二选一（验收契约支持 repo_url 直传；branch 仅 repo_url 时生效）。
 type AskRequest struct {
-	RepoID      string     `json:"repo_id" binding:"required"`
+	RepoID      string     `json:"repo_id"`
+	RepoURL     string     `json:"repo_url"`
+	Branch      string     `json:"branch"`
 	Question    string     `json:"question" binding:"required"`
 	Mode        string     `json:"mode"` // keyword|embedding|hybrid，缺省取配置
 	TopK        *int       `json:"top_k"`
 	Temperature *float64   `json:"temperature"`
+	PathFilter  string     `json:"path_filter,omitempty"` // 路径前缀过滤（如 "app/Services/%"），缺省全局
 	History     []ChatTurn `json:"history,omitempty"`
 }
 

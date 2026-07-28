@@ -41,12 +41,17 @@ func (s *AskService) Ask(ctx context.Context, req dto.AskRequest) (*dto.AskRespo
 		observability.IncAsk("failure")
 		return nil, err
 	}
-	if err := s.ensureRepoReady(ctx, req.RepoID); err != nil {
+	repoID, err := s.resolveRepoID(ctx, req)
+	if err != nil {
+		observability.IncAsk("failure")
+		return nil, err
+	}
+	if err := s.ensureRepoReady(ctx, repoID); err != nil {
 		observability.IncAsk("failure")
 		return nil, err
 	}
 
-	hits, err := s.search(ctx, mode, req.RepoID, req.Question, topK)
+	hits, err := s.search(ctx, mode, repoID, req.Question, topK, req.PathFilter)
 	if err != nil {
 		observability.IncAsk("failure")
 		return nil, err
@@ -85,12 +90,17 @@ func (s *AskService) AskStream(ctx context.Context, req dto.AskRequest, sink fun
 		observability.IncAsk("failure")
 		return err
 	}
-	if err := s.ensureRepoReady(ctx, req.RepoID); err != nil {
+	repoID, err := s.resolveRepoID(ctx, req)
+	if err != nil {
+		observability.IncAsk("failure")
+		return err
+	}
+	if err := s.ensureRepoReady(ctx, repoID); err != nil {
 		observability.IncAsk("failure")
 		return err
 	}
 
-	hits, err := s.search(ctx, mode, req.RepoID, req.Question, topK)
+	hits, err := s.search(ctx, mode, repoID, req.Question, topK, req.PathFilter)
 	if err != nil {
 		observability.IncAsk("failure")
 		return err
@@ -176,6 +186,24 @@ func (s *AskService) normalizeAskParams(req dto.AskRequest) (mode string, topK i
 	return mode, topK, temperature, nil
 }
 
+// resolveRepoID repo_id 与 repo_url 二选一解析（验收契约：repo_url 直传按 URL+branch 查仓）。
+func (s *AskService) resolveRepoID(ctx context.Context, req dto.AskRequest) (string, error) {
+	if req.RepoID != "" {
+		return req.RepoID, nil
+	}
+	if req.RepoURL == "" {
+		return "", model.NewAPIError(model.CodeInvalidParam, "repo_id or repo_url is required")
+	}
+	repo, err := s.repos.GetByURLBranch(ctx, req.RepoURL, req.Branch)
+	if err != nil {
+		if errors.Is(err, model.ErrRepoNotFound) {
+			return "", model.ErrRepoNotFound
+		}
+		return "", err
+	}
+	return repo.RepoID, nil
+}
+
 func (s *AskService) ensureRepoReady(ctx context.Context, repoID string) error {
 	repo, err := s.repos.Get(ctx, repoID)
 	if err != nil {
@@ -190,12 +218,22 @@ func (s *AskService) ensureRepoReady(ctx context.Context, repoID string) error {
 	return nil
 }
 
-func (s *AskService) search(ctx context.Context, mode, repoID, query string, topK int) ([]model.ChunkHit, error) {
+func (s *AskService) search(ctx context.Context, mode, repoID, query string, topK int, pathFilter string) ([]model.ChunkHit, error) {
 	r, ok := s.retrievers[mode]
 	if !ok {
 		return nil, model.NewAPIError(model.CodeInvalidParam, "invalid mode")
 	}
-	hits, err := r.Search(ctx, repoID, query, topK)
+	var hits []model.ChunkHit
+	var err error
+	if pathFilter != "" { // 进阶 path_filter：实现支持过滤则启用，否则回退全局检索
+		if fs, ok := r.(retriever.FilterSearcher); ok {
+			hits, err = fs.SearchWithFilter(ctx, repoID, query, topK, pathFilter)
+		} else {
+			hits, err = r.Search(ctx, repoID, query, topK)
+		}
+	} else {
+		hits, err = r.Search(ctx, repoID, query, topK)
+	}
 	if err != nil {
 		var apiErr *model.APIError
 		if errors.As(err, &apiErr) {
