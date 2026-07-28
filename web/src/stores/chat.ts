@@ -72,6 +72,38 @@ export function clearChat(repoId: string) {
   localStorage.removeItem(chatKey(repoId))
 }
 
+// typewriterPacer 打字机节流：provider 常常「沉默思考十几秒 → 几百字一秒内灌完」，
+// 直接渲染等于「一下全弹出」。把到达的 delta 入队，按 ~66 字/秒匀速放出，
+// 体感接近市面 AI 的逐字输出。timer 挂 window，与组件生命周期无关。
+function typewriterPacer(ai: ChatMsg, onUpdate?: () => void) {
+  let pending = ''
+  let timer: number | undefined
+  const push = (delta: string) => {
+    pending += delta
+    if (timer === undefined) {
+      timer = window.setInterval(() => {
+        if (pending.length === 0) {
+          clearInterval(timer)
+          timer = undefined
+          return
+        }
+        const n = Math.min(2, pending.length)
+        ai.content += pending.slice(0, n)
+        pending = pending.slice(n)
+        onUpdate?.()
+      }, 30)
+    }
+  }
+  const flush = () => {
+    if (pending.length > 0) {
+      ai.content += pending
+      pending = ''
+      onUpdate?.()
+    }
+  }
+  return { push, flush }
+}
+
 // ask 在会话仓库层发起流式请求；调用方（组件）只负责渲染与滚动。
 // onUpdate 在每帧后回调（组件用来滚到底部），组件卸载后传 null 也不影响后台续跑。
 export async function ask(
@@ -96,6 +128,7 @@ export async function ask(
   saveHistory(repoId, s.messages)
   onUpdate?.()
 
+  const pacer = typewriterPacer(ai, onUpdate)
   const { abort, done } = streamSSE(
     '/api/v1/ask/stream',
     { method: 'POST', body: { repo_id: repoId, question: q, mode, top_k: 8, history } },
@@ -104,19 +137,25 @@ export async function ask(
         const payload = JSON.parse(frame.data)
         if (frame.event === 'references') {
           ai.references = payload.references
+          onUpdate?.()
         } else if (frame.event === 'thinking') {
+          // 推理段直接追加（折叠区，不走打字机）。
           ai.thinking = (ai.thinking || '') + payload.delta
+          onUpdate?.()
         } else if (frame.event === 'token') {
-          ai.content += payload.delta
+          pacer.push(payload.delta)
         } else if (frame.event === 'done') {
+          pacer.flush()
           ai.usage = payload.usage
           ai.latency_ms = payload.latency_ms
           ai.streaming = false
+          onUpdate?.()
         } else if (frame.event === 'error') {
+          pacer.flush()
           ai.content = `出错了：${payload.message}`
           ai.streaming = false
+          onUpdate?.()
         }
-        onUpdate?.()
       } catch { /* 忽略非 JSON 帧 */ }
     },
   )
