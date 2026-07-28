@@ -397,12 +397,44 @@ func (e *WikiExecutor) Execute(ctx context.Context, t *model.Task) error {
 		toc = defaultTOC()
 	}
 
-	// generating：逐页生成 markdown。
+	// generating：逐页生成 markdown。断点续跑：已有未完成 wiki（pages<toc 且 TOC slug 一致）
+	// 时跳过已生成页——worker 中途死亡重投后只补剩余页，不整仓重来。
 	if err := update(model.TaskStateGenerating, 15); err != nil {
 		return err
 	}
+
+	skip := map[string]bool{}
 	pages := make([]store.WikiPage, 0, len(toc))
-	for i, item := range toc {
+	if existing, err := e.wikis.Get(ctx, repo.RepoID); err == nil && existing != nil &&
+		len(existing.Pages) < len(existing.TOC) && sameTOCSlugs(existing.TOC, toc) {
+		for _, p := range existing.Pages {
+			skip[p.Slug] = true
+			pages = append(pages, p)
+		}
+		e.logger.Info("wiki resume from checkpoint",
+			zap.String("repo_id", repo.RepoID),
+			zap.Int("existing_pages", len(existing.Pages)),
+			zap.Int("total_pages", len(toc)),
+		)
+	}
+
+	saveCheckpoint := func() {
+		if err := e.wikis.Save(ctx, &store.Wiki{
+			RepoID:      repo.RepoID,
+			TOC:         toc,
+			Pages:       pages,
+			TaskID:      t.TaskID,
+			GeneratedAt: time.Now().UTC(),
+		}); err != nil {
+			e.logger.Warn("wiki checkpoint save failed", zap.String("repo_id", repo.RepoID), zap.Error(err))
+		}
+	}
+
+	donePages := len(pages)
+	for _, item := range toc {
+		if skip[item.Slug] {
+			continue // 已完成页：断点跳过
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -411,6 +443,7 @@ func (e *WikiExecutor) Execute(ctx context.Context, t *model.Task) error {
 		pageHits, _ := r.Search(ctx, repo.RepoID, item.Title, 8)
 		content, err := e.generatePage(ctx, repo, item, pageHits)
 		if err != nil {
+			saveCheckpoint() // 失败也先落已完成的页，便于下次续跑
 			e.failTask(ctx, t.TaskID, model.TaskStateGenerating)
 			return nil
 		}
@@ -421,7 +454,9 @@ func (e *WikiExecutor) Execute(ctx context.Context, t *model.Task) error {
 			SortOrder: item.SortOrder,
 			UpdatedAt: time.Now().UTC(),
 		})
-		percent := 15 + 80*(i+1)/len(toc)
+		donePages++
+		saveCheckpoint() // 逐页落库：worker 死亡不丢已完成进度
+		percent := 15 + 80*donePages/len(toc)
 		if err := update(model.TaskStateGenerating, percent); err != nil {
 			return err
 		}
@@ -507,6 +542,19 @@ func (e *WikiExecutor) failTask(ctx context.Context, taskID string, stage model.
 		Err:        &model.TaskError{Code: model.CodeTaskInterrupted, Message: model.MessageOf(model.CodeTaskInterrupted), Stage: string(stage)},
 		FinishedAt: &now,
 	})
+}
+
+// sameTOCSlugs 判断两份 TOC 的 slug 序列是否一致（断点续跑的续接前提；不一致整仓重来）。
+func sameTOCSlugs(a, b []store.WikiTOCItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Slug != b[i].Slug {
+			return false
+		}
+	}
+	return true
 }
 
 func defaultTOC() []store.WikiTOCItem {
