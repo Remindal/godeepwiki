@@ -13,6 +13,7 @@ export interface ChatMsg {
   refsOpen?: boolean
   usage?: { prompt_tokens: number; completion_tokens: number }
   latency_ms?: number
+  startedAt?: number // 流式开始时刻（“已思考 N 秒”展示用）
 }
 
 export interface ChatSession {
@@ -122,8 +123,13 @@ export async function ask(
     .map((m) => ({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }))
 
   s.messages.push({ role: 'user', content: q })
-  const ai: ChatMsg = { role: 'ai', content: '', thinking: '', streaming: true, refsOpen: false, thinkingOpen: false }
-  s.messages.push(ai)
+  s.messages.push({
+    role: 'ai', content: '', thinking: '', streaming: true, refsOpen: false, thinkingOpen: false,
+    startedAt: Date.now(),
+  })
+  // 必须经响应式代理访问（数组下标经 Proxy 包装）：直接改原始对象不会触发重渲染，
+  // 曾导致“停留在思考中、切走再回来才显示”的问题。
+  const ai = s.messages[s.messages.length - 1]
   s.streaming = true
   saveHistory(repoId, s.messages)
   onUpdate?.()

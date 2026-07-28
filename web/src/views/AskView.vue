@@ -27,7 +27,9 @@
                 <div v-show="m.thinkingOpen" class="thinking-content dw-faint">{{ m.thinking }}</div>
               </div>
               <div class="bubble ai-bubble" v-html="renderMd(m.content)"></div>
-              <div v-if="m.streaming && !m.content" class="typing dw-faint">思考中…</div>
+              <div v-if="m.streaming && !m.content" class="typing dw-faint">
+                思考中<span v-if="m.startedAt"> · 已思考 {{ elapsed(m) }} 秒</span>…
+              </div>
 
               <div v-if="m.references?.length" class="refs">
                 <div class="refs-title dw-faint" @click="m.refsOpen = !m.refsOpen">
@@ -80,10 +82,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { marked } from 'marked'
-import { ask, clearChat, getChat } from '../stores/chat'
+import { ask, clearChat, getChat, type ChatMsg } from '../stores/chat'
 
 const route = useRoute()
 const repoId = route.params.repoId as string
@@ -101,6 +103,20 @@ const hints = ['这个仓库是干什么的？', '核心入口函数在哪里？
 function renderMd(text: string) {
   return marked.parse(text || '', { async: false })
 }
+
+// “已思考 N 秒”：1s 节拍器驱动重渲染（仅展示层计时，不影响后台流）。
+const nowTs = ref(Date.now())
+let ticker: number | undefined
+function elapsed(m: ChatMsg): number {
+  void nowTs.value // 依赖追踪：每秒触发一次重算
+  return m.startedAt ? Math.max(0, Math.floor((Date.now() - m.startedAt) / 1000)) : 0
+}
+onMounted(() => {
+  ticker = window.setInterval(() => {
+    if (streaming.value) nowTs.value = Date.now()
+  }, 1000)
+})
+onBeforeUnmount(() => clearInterval(ticker))
 
 async function scrollBottom() {
   await nextTick()
