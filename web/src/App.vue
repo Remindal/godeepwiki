@@ -23,6 +23,24 @@
         </div>
       </nav>
 
+      <div v-if="histories.length" class="history">
+        <div class="history-title dw-faint">历史对话</div>
+        <div class="history-list">
+          <div
+            v-for="h in histories"
+            :key="h.repoId"
+            class="history-item"
+            :class="{ active: route.params.repoId === h.repoId }"
+            @click="$router.push(`/ask/${h.repoId}`)"
+          >
+            <div class="history-preview">{{ h.preview || '（空对话）' }}</div>
+            <div class="history-meta dw-faint">
+              {{ repoName(h.repoId) }} · {{ h.count }} 条 · {{ formatTime(h.updatedAt) }}
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="sidebar-footer">
         <div class="nav-item" :class="{ active: isActive('/system') }" @click="$router.push('/system')">
           <span class="nav-dot" /> 系统状态
@@ -37,7 +55,11 @@
 </template>
 
 <script setup lang="ts">
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { api } from './api/client'
+import type { PageResult, Repo } from './api/types'
+import { historiesVersion, listChatHistories, type ChatHistoryEntry } from './stores/chat'
 
 const route = useRoute()
 const navItems = [
@@ -46,6 +68,42 @@ const navItems = [
 ]
 const isActive = (path: string) =>
   path === '/' ? route.path === '/' || route.path.startsWith('/ask') || route.path.startsWith('/wiki') : route.path.startsWith(path)
+
+// 历史对话栏目：扫描 localStorage 会话索引 + 仓库名映射；historiesVersion 驱动刷新。
+const histories = ref<ChatHistoryEntry[]>([])
+const repoNames = ref(new Map<string, string>())
+
+function reloadHistories() {
+  histories.value = listChatHistories()
+}
+
+function repoName(repoId: string): string {
+  return repoNames.value.get(repoId) ?? repoId.slice(0, 12)
+}
+
+function formatTime(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const today = new Date()
+  return d.toDateString() === today.toDateString()
+    ? d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+}
+
+const _v = computed(() => historiesVersion.value)
+watch(_v, reloadHistories)
+
+onMounted(async () => {
+  reloadHistories()
+  try {
+    const res = await api.get<PageResult<Repo>>('/api/v1/repos?page_size=100')
+    const m = new Map<string, string>()
+    for (const r of res.items ?? []) {
+      m.set(r.repo_id, r.repo_url.replace(/\.git$/, '').split('/').slice(-2).join('/'))
+    }
+    repoNames.value = m
+  } catch { /* 名字映射失败则用 repoId 前缀 */ }
+})
 </script>
 
 <style scoped>
@@ -103,7 +161,35 @@ const isActive = (path: string) =>
 .new-chat-btn:hover { box-shadow: var(--dw-shadow); }
 .new-chat-btn span { margin-right: 4px; }
 
-.nav { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.nav { display: flex; flex-direction: column; gap: 2px; }
+
+.history {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--dw-border);
+}
+.history-title { font-size: 12px; padding: 0 10px 6px; }
+.history-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.history-item {
+  padding: 7px 10px;
+  border-radius: var(--dw-radius-sm);
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.history-item:hover { background: var(--dw-bg-mute); }
+.history-item.active { background: var(--dw-white); box-shadow: var(--dw-shadow); }
+.history-preview {
+  font-size: 13px;
+  color: var(--dw-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-meta { font-size: 11px; margin-top: 2px; }
 
 .nav-item {
   display: flex;

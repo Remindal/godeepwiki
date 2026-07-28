@@ -1,7 +1,10 @@
-import { reactive } from 'vue'
+import { reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { streamSSE, ApiError } from '../api/client'
 import type { Reference } from '../api/types'
+
+// historiesVersion 历史列表版本号：saveHistory 时递增，侧栏 watch 它刷新「历史对话」栏目。
+export const historiesVersion = ref(0)
 
 export interface ChatMsg {
   role: 'user' | 'ai'
@@ -32,7 +35,9 @@ function loadHistory(repoId: string): ChatMsg[] {
   try {
     const raw = localStorage.getItem(chatKey(repoId))
     if (!raw) return []
-    const list = JSON.parse(raw) as ChatMsg[]
+    const parsed = JSON.parse(raw)
+    // 兼容两种格式：{updatedAt, messages} 与旧版纯数组。
+    const list: ChatMsg[] = Array.isArray(parsed) ? parsed : parsed?.messages ?? []
     return Array.isArray(list) ? list : []
   } catch {
     return []
@@ -52,8 +57,43 @@ function saveHistory(repoId: string, list: ChatMsg[]) {
         usage: m.usage,
         latency_ms: m.latency_ms,
       }))
-    localStorage.setItem(chatKey(repoId), JSON.stringify(finalized))
+    localStorage.setItem(
+      chatKey(repoId),
+      JSON.stringify({ updatedAt: Date.now(), messages: finalized }),
+    )
+    historiesVersion.value++
   } catch { /* 存储满等异常静默 */ }
+}
+
+// ChatHistoryEntry 侧栏「历史对话」条目。
+export interface ChatHistoryEntry {
+  repoId: string
+  preview: string // 首条用户消息（截断）
+  count: number
+  updatedAt: number
+}
+
+// listChatHistories 扫描 localStorage 中的全部会话（dw_chat_*），按最近更新倒序。
+export function listChatHistories(): ChatHistoryEntry[] {
+  const out: ChatHistoryEntry[] = []
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i)
+    if (!key || !key.startsWith('dw_chat_')) continue
+    try {
+      const raw = JSON.parse(localStorage.getItem(key) || '')
+      const msgs: ChatMsg[] = Array.isArray(raw) ? raw : raw?.messages ?? []
+      if (!msgs.length) continue
+      const firstUser = msgs.find((m) => m.role === 'user')
+      out.push({
+        repoId: key.slice('dw_chat_'.length),
+        preview: (firstUser?.content ?? '').slice(0, 40),
+        count: msgs.length,
+        updatedAt: Array.isArray(raw) ? 0 : raw.updatedAt ?? 0,
+      })
+    } catch { /* 跳过坏数据 */ }
+  }
+  out.sort((a, b) => b.updatedAt - a.updatedAt)
+  return out
 }
 
 export function getChat(repoId: string): ChatSession {
@@ -71,6 +111,7 @@ export function clearChat(repoId: string) {
   s.messages = []
   s.streaming = false
   localStorage.removeItem(chatKey(repoId))
+  historiesVersion.value++
 }
 
 // typewriterPacer 打字机节流：provider 常常「沉默思考十几秒 → 几百字一秒内灌完」，
