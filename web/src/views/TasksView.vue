@@ -5,7 +5,10 @@
         <h1>任务中心</h1>
         <p class="dw-muted">摄取 / 刷新 / Wiki 任务的实时进度</p>
       </div>
-      <el-button @click="load" :loading="loading">刷新</el-button>
+      <div class="head-side">
+        <span v-if="lastRefresh" class="dw-faint refresh-time">更新于 {{ lastRefresh }}</span>
+        <el-button @click="load(true)" :loading="loading">刷新</el-button>
+      </div>
     </header>
 
     <div v-if="!tasks.length && !loading" class="empty dw-faint">暂无任务</div>
@@ -50,17 +53,20 @@ import type { PageResult, Task } from '../api/types'
 
 const tasks = ref<Task[]>([])
 const loading = ref(false)
+const lastRefresh = ref('')
 let timer: number | undefined
 
 const typeText = (t: string) => ({ ingest: '摄取', refresh: '刷新', wiki: 'Wiki' }[t] ?? t)
 const isTerminal = (s: string) => ['completed', 'failed', 'cancelled'].includes(s)
 const formatTime = (s: string) => new Date(s).toLocaleString()
 
-async function load() {
+async function load(manual = false) {
   loading.value = true
   try {
     const res = await api.get<PageResult<Task>>('/api/v1/tasks?page_size=50')
     tasks.value = res.items ?? []
+    lastRefresh.value = new Date().toLocaleTimeString()
+    if (manual) ElMessage.success('已刷新')
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '加载失败')
   } finally {
@@ -90,6 +96,8 @@ onBeforeUnmount(() => clearInterval(timer))
 <style scoped>
 .page { max-width: 760px; margin: 0 auto; padding: 32px 24px; }
 .page-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }
+.head-side { display: flex; align-items: center; gap: 10px; }
+.refresh-time { font-size: 12px; }
 h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
 .page-head p { margin: 0; font-size: 13px; }
 .empty { text-align: center; padding: 80px 0; }
