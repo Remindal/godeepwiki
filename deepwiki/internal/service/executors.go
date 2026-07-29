@@ -25,7 +25,6 @@ import (
 )
 
 func ptrState(s model.TaskState) *model.TaskState { return &s }
-func ptrTime(t time.Time) *time.Time              { return &t }
 
 // ---------------- ingest executor ----------------
 
@@ -122,7 +121,7 @@ func (e *IngestExecutor) Execute(ctx context.Context, t *model.Task) error {
 	}
 	repo.State = "ready"
 	repo.LocalPath = finalDir
-	repo.Stats = model.RepoStats{Files: stats.Files, Chunks: stats.Chunks, Tokens: stats.Tokens}
+	repo.Stats = model.RepoStats(stats)
 	repo.UpdatedAt = time.Now().UTC()
 	if err := e.repos.Update(ctx, repo); err != nil {
 		e.logger.Error("update repo after ingest failed", zap.String("repo_id", repo.RepoID), zap.Error(err))
@@ -565,19 +564,12 @@ func defaultTOC() []store.WikiTOCItem {
 	}
 }
 
-// stateChangedPayload task.state_changed 事件载荷（与 ingest.Pipeline 同一结构，payload 字段冻结）。
-type stateChangedPayload struct {
-	State    model.TaskState `json:"state"`
-	Progress model.Progress  `json:"progress"`
-	Stats    model.Stats     `json:"stats"`
-}
-
 // publishStateEvent 发布 task.state_changed 事件（失败仅 WARN，任务状态以 Postgres 为准）。
 func publishStateEvent(ctx context.Context, bus eventbus.EventBus, logger *zap.Logger, t *model.Task, state model.TaskState, progress model.Progress, stats model.Stats) {
 	if bus == nil {
 		return
 	}
-	payload, err := json.Marshal(stateChangedPayload{State: state, Progress: progress, Stats: stats})
+	payload, err := json.Marshal(model.StateChangedPayload{State: state, Progress: progress, Stats: stats})
 	if err != nil {
 		logger.Warn("marshal state_changed payload failed", zap.Error(err))
 		return

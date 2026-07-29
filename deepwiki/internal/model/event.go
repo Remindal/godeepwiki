@@ -13,6 +13,14 @@ const (
 	EventTypeGap              = "gap"
 )
 
+// StateChangedPayload task.state_changed 事件载荷（字段冻结，结构化字段禁止拼字符串）。
+// ingest.Pipeline 与 WikiExecutor 共用；Manager.Submit 的 pending 事件另有 queue_position 扩展字段。
+type StateChangedPayload struct {
+	State    TaskState `json:"state"`
+	Progress Progress  `json:"progress"`
+	Stats    Stats     `json:"stats"`
+}
+
 // Event 统一事件。Seq 单调递增，是 SSE id / Last-Event-ID 的依据；
 // 物理载体为 Redis Streams（events:task:<task_id>，XTRIM MAXLEN ~ 1000）。
 // Timestamp 落库/落流均为 UTC + RFC3339（硬约束 #13）。

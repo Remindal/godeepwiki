@@ -3,7 +3,6 @@ package embed
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/openai/openai-go"
@@ -133,33 +132,6 @@ func clampEmbeddingInputs(texts []string, maxRunes int, logger *zap.Logger) []st
 	return out
 }
 
-// fallbackDimensions 按模型名兜底维度（仅用于返回 Dimensions()，真实维度以首次请求探测为准）。
-func fallbackDimensions(provider, model string) int {
-	switch provider {
-	case "openai":
-		if d, ok := openAIDims[model]; ok {
-			return d
-		}
-	case "dashscope":
-		if d, ok := dashscopeDims[model]; ok {
-			return d
-		}
-	case "siliconflow":
-		if d, ok := siliconflowDims[model]; ok {
-			return d
-		}
-	case "voyage":
-		if d, ok := voyageDims[model]; ok {
-			return d
-		}
-	}
-	return 0
-}
-
-// sortByIndex 辅助：openai-go 返回的 Data 可能按索引顺序，保险起见按 Index 排序。
-func sortByIndex(data []openai.Embedding) {
-	sort.Slice(data, func(i, j int) bool { return data[i].Index < data[j].Index })
-}
 
 // stateString 把 gobreaker.State 映射为 health 字符串。
 func stateString(s gobreaker.State) string {
@@ -174,6 +146,3 @@ func stateString(s gobreaker.State) string {
 		return "unknown"
 	}
 }
-
-// _ 占位，避免后续若 fallbackDimensions 未使用被误删。
-var _ = sortByIndex

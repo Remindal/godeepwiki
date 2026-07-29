@@ -202,19 +202,13 @@ func snapshotStats(pc *PipelineContext) model.Stats {
 	return stats
 }
 
-// stateChangedPayload task.state_changed 事件载荷（结构化字段，禁止拼字符串）。
-type stateChangedPayload struct {
-	State    model.TaskState `json:"state"`
-	Progress model.Progress  `json:"progress"`
-	Stats    model.Stats     `json:"stats"`
-}
 
 // publishState 发布状态事件；发布失败只记 WARN 不中断 Pipeline（任务状态以 Postgres 为准）。
 func (p *Pipeline) publishState(ctx context.Context, pc *PipelineContext, state model.TaskState, progress model.Progress, stats model.Stats) {
 	if p.bus == nil {
 		return
 	}
-	payload, err := json.Marshal(stateChangedPayload{State: state, Progress: progress, Stats: stats})
+	payload, err := json.Marshal(model.StateChangedPayload{State: state, Progress: progress, Stats: stats})
 	if err != nil {
 		p.logger.Warn("marshal state_changed payload failed", zap.Error(err))
 		return

@@ -96,7 +96,7 @@ func TestStore(t *testing.T) {
 	_, _ = pool.Exec(ctx, `DELETE FROM repos WHERE repo_id='repo_cascade'`)
 	_, _ = pool.Exec(ctx, `DELETE FROM tasks WHERE task_id='tsk_cascade'`)
 
-	_, err = pool.Exec(ctx,
+	_, _ = pool.Exec(ctx,
 		`INSERT INTO repos (repo_id,repo_url,branch,created_at,updated_at) 
 		 VALUES ('repo_cascade','https://github.com/test','main',now(),now())`,
 	)

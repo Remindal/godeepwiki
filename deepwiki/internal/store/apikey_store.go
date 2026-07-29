@@ -4,10 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
@@ -28,8 +26,6 @@ type APIKeyStore interface {
 	// Upsert 启动引导：把 DEEPWIKI_API_KEYS / DEEPWIKI_ADMIN_KEY 中的明文 key 哈希后幂等写入
 	//（已存在同 key_hash 则跳过；salt 每 key 随机生成）。
 	Upsert(ctx context.Context, k *APIKey) error
-	// GetByHash 认证二级查找的 Postgres 端（Redis 缓存 auth:key:<sha256(key)> TTL 60s 在前）。
-	GetByHash(ctx context.Context, keyHash string) (*APIKey, error)
 	// FindByKey 按明文 key 查找：salt 每 key 随机，须逐条比对 SHA-256(salt‖key)（总纲 R14）。
 	// 未命中或已吊销返回 (nil, nil)。
 	FindByKey(ctx context.Context, key string) (*APIKey, error)
@@ -61,23 +57,6 @@ func (s *pgAPIKeyStore) Upsert(ctx context.Context, k *APIKey) error {
 		ON CONFLICT (key_hash) DO NOTHING
 	`, k.KeyID, k.Name, k.KeyHash, k.Salt, k.IsAdmin, now)
 	return err
-}
-
-func (s *pgAPIKeyStore) GetByHash(ctx context.Context, keyHash string) (*APIKey, error) {
-	row := s.pool.QueryRow(ctx, `
-		SELECT key_id, name, key_hash, salt, is_admin, revoked_at, created_at
-		FROM api_keys
-		WHERE key_hash = $1 AND revoked_at IS NULL
-	`, keyHash)
-	var k APIKey
-	err := row.Scan(&k.KeyID, &k.Name, &k.KeyHash, &k.Salt, &k.IsAdmin, &k.RevokedAt, &k.CreatedAt)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &k, nil
 }
 
 func (s *pgAPIKeyStore) FindByKey(ctx context.Context, key string) (*APIKey, error) {
