@@ -26,7 +26,7 @@
       <div v-if="generating" class="center dw-muted">正在生成 Wiki，这可能需要十几分钟…</div>
       <div v-else-if="current" class="content-inner">
         <h1 class="page-title">{{ current.title }}</h1>
-        <div class="md" v-html="renderMd(current.content_md)"></div>
+        <div ref="mdEl" class="md" v-html="renderMd(current.content_md)"></div>
       </div>
       <div v-else class="center">
         <p class="dw-muted">这个仓库还没有 Wiki</p>
@@ -37,12 +37,42 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { marked } from 'marked'
+import mermaid from 'mermaid'
 import { ElMessage } from 'element-plus'
 import { api, ApiError } from '../api/client'
 import type { TaskSubmitted, Wiki, WikiPage } from '../api/types'
+
+mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'strict' })
+const mdEl = ref<HTMLElement>()
+
+// mermaid 代码块渲染为 <pre class="mermaid">，随后交给 mermaid.run 出图。
+marked.use({
+  renderer: {
+    code(code: string, infostring?: string) {
+      if (infostring?.trim() === 'mermaid') {
+        return `<pre class="mermaid">${escapeHtml(code)}</pre>`
+      }
+      return false as unknown as string
+    },
+  },
+})
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+async function renderMermaid() {
+  await nextTick()
+  const nodes = mdEl.value?.querySelectorAll('pre.mermaid')
+  if (nodes?.length) {
+    try {
+      await mermaid.run({ nodes: Array.from(nodes) as HTMLElement[] })
+    } catch { /* 图渲染失败保留源码块 */ }
+  }
+}
 
 const route = useRoute()
 const repoId = route.params.repoId as string
@@ -52,10 +82,15 @@ const generating = ref(false)
 
 const renderMd = (md: string) => marked.parse(md || '', { async: false })
 
+watch(current, () => {
+  void renderMermaid()
+})
+
 async function load() {
   try {
     wiki.value = await api.get<Wiki>(`/api/v1/repos/${repoId}/wiki`)
     current.value = wiki.value.pages?.[0] ?? null
+    void renderMermaid()
   } catch (e) {
     if (!(e instanceof ApiError && e.code === 40403)) {
       ElMessage.error(e instanceof Error ? e.message : '加载失败')

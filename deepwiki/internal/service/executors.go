@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -338,6 +339,7 @@ type WikiExecutor struct {
 	tasks      task.TaskStore
 	repos      store.RepoStore
 	wikis      store.WikiStore
+	chunks     store.ChunkStore
 	retrievers map[string]retriever.Retriever
 	llm        llm.LLM
 	cfg        *config.Manager
@@ -345,8 +347,8 @@ type WikiExecutor struct {
 	logger     *zap.Logger
 }
 
-func NewWikiExecutor(tasks task.TaskStore, repos store.RepoStore, wikis store.WikiStore, retrievers map[string]retriever.Retriever, l llm.LLM, cfg *config.Manager, bus eventbus.EventBus, logger *zap.Logger) *WikiExecutor {
-	return &WikiExecutor{tasks: tasks, repos: repos, wikis: wikis, retrievers: retrievers, llm: l, cfg: cfg, bus: bus, logger: logger}
+func NewWikiExecutor(tasks task.TaskStore, repos store.RepoStore, wikis store.WikiStore, chunks store.ChunkStore, retrievers map[string]retriever.Retriever, l llm.LLM, cfg *config.Manager, bus eventbus.EventBus, logger *zap.Logger) *WikiExecutor {
+	return &WikiExecutor{tasks: tasks, repos: repos, wikis: wikis, chunks: chunks, retrievers: retrievers, llm: l, cfg: cfg, bus: bus, logger: logger}
 }
 
 func (e *WikiExecutor) Type() model.TaskType { return model.TaskTypeWiki }
@@ -483,18 +485,24 @@ func (e *WikiExecutor) Execute(ctx context.Context, t *model.Task) error {
 }
 
 func (e *WikiExecutor) generateTOC(ctx context.Context, repo *model.Repo, hits []model.ChunkHit) ([]store.WikiTOCItem, error) {
-	var paths []string
-	seen := map[string]bool{}
-	for _, h := range hits {
-		if !seen[h.Chunk.Path] {
-			seen[h.Chunk.Path] = true
-			paths = append(paths, h.Chunk.Path)
+	// 目录依据升级为全量文件树（FileHashes 覆盖仓库全部文件路径），比单次检索更完整。
+	paths := e.repoFilePaths(ctx, repo.RepoID)
+	if len(paths) == 0 {
+		seen := map[string]bool{}
+		for _, h := range hits { // FileHashes 不可用时回退检索路径
+			if !seen[h.Chunk.Path] {
+				seen[h.Chunk.Path] = true
+				paths = append(paths, h.Chunk.Path)
+			}
 		}
 	}
-	prompt := fmt.Sprintf(`你是技术文档架构师。基于仓库 %s（分支 %s）的以下文件路径，输出一个 wiki 目录大纲。
-只输出 JSON：{"toc":[{"slug":"overview","title":"项目概览","parent_slug":"","sort_order":1},...]}
-slug 用英文小写短横线；toc 项数量 5~8 个；不要输出任何其他文字。
-文件路径：%s`, repo.RepoURL, repo.Branch, strings.Join(paths, ", "))
+	prompt := fmt.Sprintf(`你是技术文档架构师。基于仓库 %s（分支 %s）的完整文件树，设计一份 wiki 目录大纲。
+要求：
+- 按模块/职责划分（如：项目概览、架构设计、核心流程、数据模型、配置与部署、API 参考等，按实际仓库内容取舍）；
+- toc 项数量 5~8 个，slug 用英文小写短横线；
+- 只输出 JSON：{"toc":[{"slug":"overview","title":"项目概览","parent_slug":"","sort_order":1},...]}，不要输出任何其他文字。
+文件树：
+%s`, repo.RepoURL, repo.Branch, strings.Join(paths, "\n"))
 
 	resp, err := e.llm.Generate(ctx, model.ChatRequest{
 		Model:       e.llm.ModelName(),
@@ -512,14 +520,48 @@ slug 用英文小写短横线；toc 项数量 5~8 个；不要输出任何其他
 	return plan.TOC, nil
 }
 
+// repoFilePaths 仓库全量文件路径（按目录排序，超 300 条截断保留首尾）。
+func (e *WikiExecutor) repoFilePaths(ctx context.Context, repoID string) []string {
+	if e.chunks == nil {
+		return nil
+	}
+	hashes, err := e.chunks.FileHashes(ctx, repoID)
+	if err != nil || len(hashes) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(hashes))
+	for p := range hashes {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	const maxPaths = 300
+	if len(paths) > maxPaths {
+		head := paths[:maxPaths/2]
+		tail := paths[len(paths)-maxPaths/2:]
+		paths = append(append([]string{}, head...), tail...)
+	}
+	return paths
+}
+
 func (e *WikiExecutor) generatePage(ctx context.Context, repo *model.Repo, item store.WikiTOCItem, hits []model.ChunkHit) (string, error) {
 	var sb strings.Builder
 	for _, h := range hits {
 		sb.WriteString(fmt.Sprintf("\n--- %s:%d-%d ---\n%s\n", h.Chunk.Path, h.Chunk.StartLine, h.Chunk.EndLine, h.Chunk.Content))
 	}
+	mermaidFence := "```" + "mermaid"
 	prompt := fmt.Sprintf(`基于以下代码片段，为仓库 %s 撰写 wiki 页面「%s」（markdown 格式）。
-要求：结构清晰、包含小标题；引用代码用 [path:start-end] 标注来源；不要编造不存在的文件或行号。
-代码片段：%s`, repo.RepoURL, item.Title, sb.String())
+要求：
+- 结构清晰、包含小标题；引用代码用 [path:start-end] 标注来源，禁止编造文件或行号；
+- **必须**插入至少 1 个 mermaid 图（%s 代码块）：架构总览用 flowchart TD，调用时序用 sequenceDiagram，实体关系用 erDiagram，按页面主题选最合适的一种；节点标签用简短中文，禁止在标签中使用引号、括号和分号；
+- 图必须基于真实代码结构绘制，放在对应小节正文之后，不要虚构模块。
+示例格式：
+%s
+flowchart TD
+  A[用户请求] --> B[路由层]
+  B --> C[控制器]
+  C --> D[服务层]
+%s
+代码片段：%s`, repo.RepoURL, item.Title, mermaidFence, mermaidFence, "```", sb.String())
 
 	resp, err := e.llm.Generate(ctx, model.ChatRequest{
 		Model:       e.llm.ModelName(),

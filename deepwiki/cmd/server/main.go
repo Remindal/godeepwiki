@@ -192,7 +192,7 @@ func main() {
 	}
 	tm.RegisterExecutor(service.NewIngestExecutor(taskStore, repoStore, cloner, emb, chunkStore, bus, cm, onAutoWiki, logger))
 	tm.RegisterExecutor(service.NewRefreshExecutor(taskStore, repoStore, cloner, emb, chunkStore, bus, cm, logger))
-	tm.RegisterExecutor(service.NewWikiExecutor(taskStore, repoStore, wikiStore, retrievers, llmClient, cm, bus, logger))
+	tm.RegisterExecutor(service.NewWikiExecutor(taskStore, repoStore, wikiStore, chunkStore, retrievers, llmClient, cm, bus, logger))
 	tm.Start(ctx, consumer)
 	tm.StartDLQConsumer(ctx, mq)
 
