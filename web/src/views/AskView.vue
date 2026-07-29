@@ -87,14 +87,17 @@
           @keydown.enter.exact.prevent="submit(input)"
         />
         <div class="input-side">
-          <input
-            v-model="pathFilter"
-            class="path-filter-input"
-            :class="{ invalid: pathFilterInvalid }"
-            placeholder="限定目录（可留空）"
-            :title="pathFilterInvalid || '只在此路径前缀内检索，如 app/Services/ 或 routes/web.php'"
-            :disabled="streaming"
-          />
+          <span class="pf-wrap">
+            <span v-if="pathFilterInvalid" class="pf-tip">{{ pathFilterInvalid }}</span>
+            <input
+              v-model="pathFilter"
+              class="path-filter-input"
+              :class="{ invalid: pathFilterInvalid }"
+              placeholder="限定目录（可留空）"
+              title="只在此路径前缀内检索，如 app/Services/ 或 routes/web.php"
+              :disabled="streaming"
+            />
+          </span>
           <el-select v-model="mode" size="small" class="mode-select" :disabled="streaming">
             <el-option label="混合检索" value="hybrid" />
             <el-option label="向量检索" value="embedding" />
@@ -350,7 +353,31 @@ async function openRef(r: Reference) {
 .path-filter-input::placeholder { color: var(--dw-text-3); }
 .path-filter-input.invalid {
   background: #f5f5f5;
-  outline: 1px solid #000;
+  outline: 1px solid #d93026;
+}
+
+.pf-wrap { position: relative; display: inline-flex; }
+.pf-tip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: #d93026;
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 3px 9px;
+  border-radius: 999px; /* 红色圆角胶囊提示 */
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 10;
+}
+.pf-tip::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 14px;
+  border: 4px solid transparent;
+  border-top-color: #d93026;
 }
 .send-btn {
   width: 32px; height: 32px; border: none; border-radius: 50%;
