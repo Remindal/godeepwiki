@@ -228,6 +228,7 @@ export async function ask(
   convId: string,
   question: string,
   mode: string,
+  pathFilter: string,
   onUpdate?: () => void,
 ): Promise<void> {
   const s = getChat(repoId, convId)
@@ -251,9 +252,12 @@ export async function ask(
   onUpdate?.()
 
   const pacer = typewriterPacer(ai, onUpdate)
+  const body: Record<string, unknown> = { repo_id: repoId, question: q, mode, top_k: 8, history }
+  if (pathFilter.trim()) body.path_filter = pathFilter.trim()
+
   const { abort, done } = streamSSE(
     '/api/v1/ask/stream',
-    { method: 'POST', body: { repo_id: repoId, question: q, mode, top_k: 8, history } },
+    { method: 'POST', body },
     (frame) => {
       try {
         const payload = JSON.parse(frame.data)

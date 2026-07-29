@@ -87,6 +87,13 @@
           @keydown.enter.exact.prevent="submit(input)"
         />
         <div class="input-side">
+          <input
+            v-model="pathFilter"
+            class="path-filter-input"
+            placeholder="限定目录（可留空）"
+            title="只在此路径前缀内检索，如 app/Services/ 或 routes/web.php"
+            :disabled="streaming"
+          />
           <el-select v-model="mode" size="small" class="mode-select" :disabled="streaming">
             <el-option label="混合检索" value="hybrid" />
             <el-option label="向量检索" value="embedding" />
@@ -116,6 +123,7 @@ const route = useRoute()
 const router = useRouter()
 const input = ref('')
 const mode = ref('hybrid')
+const pathFilter = ref(localStorage.getItem(`dw_pathfilter_${route.params.repoId}`) || '')
 const scrollEl = ref<HTMLElement>()
 
 // repoId 跟随路由参数响应式变化；convId 跟随 query.c（默认 default）。
@@ -182,7 +190,8 @@ function submit(question: string) {
   const q = question.trim()
   if (!q || streaming.value) return
   input.value = ''
-  void ask(repoId.value, convId.value, q, mode.value, scrollBottom)
+  localStorage.setItem(`dw_pathfilter_${repoId.value}`, pathFilter.value)
+  void ask(repoId.value, convId.value, q, mode.value, pathFilter.value, scrollBottom)
 }
 
 function stop() {
@@ -312,6 +321,18 @@ async function openRef(r: Reference) {
 }
 .input-side { display: flex; align-items: center; gap: 8px; }
 .mode-select { width: 104px; }
+.path-filter-input {
+  width: 150px;
+  border: none;
+  outline: none;
+  font: inherit;
+  font-size: 12px;
+  color: var(--dw-text-2);
+  background: var(--dw-bg-soft);
+  border-radius: 8px;
+  padding: 5px 8px;
+}
+.path-filter-input::placeholder { color: var(--dw-text-3); }
 .send-btn {
   width: 32px; height: 32px; border: none; border-radius: 50%;
   background: var(--dw-black); color: var(--dw-white);
