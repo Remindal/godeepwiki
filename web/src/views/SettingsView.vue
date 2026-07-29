@@ -104,10 +104,11 @@ const masked = (k: string) => (k ? k : '未配置')
 async function load() {
   loading.value = true
   try {
-    const cfg = await api.get<Cfg & { version?: number }>('/api/v1/config')
-    form.value.llm = { ...form.value.llm, ...cfg.llm }
-    form.value.embedding = { ...form.value.embedding, ...cfg.embedding }
-    form.value.retriever = { ...form.value.retriever, ...cfg.retriever }
+    const res = await api.get<{ version: number; config: Cfg }>('/api/v1/config')
+    version.value = res.version
+    form.value.llm = { ...form.value.llm, ...res.config.llm }
+    form.value.embedding = { ...form.value.embedding, ...res.config.embedding }
+    form.value.retriever = { ...form.value.retriever, ...res.config.retriever }
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '加载配置失败')
   } finally {
