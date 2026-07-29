@@ -42,6 +42,9 @@
       </div>
 
       <div class="sidebar-footer">
+        <div class="nav-item" :class="{ active: isActive('/settings') }" @click="$router.push('/settings')">
+          <span class="nav-dot" /> 设置
+        </div>
         <div class="nav-item" :class="{ active: isActive('/system') }" @click="$router.push('/system')">
           <span class="nav-dot" /> 系统状态
         </div>

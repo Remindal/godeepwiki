@@ -8,6 +8,7 @@ const router = createRouter({
     { path: '/wiki/:repoId', name: 'wiki', component: () => import('../views/WikiView.vue') },
     { path: '/tasks', name: 'tasks', component: () => import('../views/TasksView.vue') },
     { path: '/system', name: 'system', component: () => import('../views/SystemView.vue') },
+    { path: '/settings', name: 'settings', component: () => import('../views/SettingsView.vue') },
   ],
 })
 
