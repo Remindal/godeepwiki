@@ -31,10 +31,13 @@
 
 ```bash
 cd deepwiki
-cp .env.example .env   # 按下方说明填密钥
+cp .env.example .env   # 复制模板，按下表填入你自己的 key（.env 永不提交）
 docker compose up -d --build
 docker compose ps      # 10 个容器全部 healthy 即就绪
 ```
+
+> 密钥安全约定：仓库只提交 `.env.example` 空占位模板，真实 key 一律填在你自己的 `.env`
+> （已 gitignore）。`configs/config.yaml` 不落任何明文密钥，全部经环境变量注入。
 
 ### 2. 必填环境变量（`.env`）
 
