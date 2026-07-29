@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,7 +139,28 @@ func validateAskRequest(req dto.AskRequest) []model.ErrorDetail {
 	if req.TopK != nil && (*req.TopK < 1 || *req.TopK > 30) {
 		details = append(details, model.ErrorDetail{Field: "top_k", Issue: "must be between 1 and 30"})
 	}
+	details = append(details, validatePathFilter(req.PathFilter)...)
 	return details
+}
+
+// validatePathFilter 路径前缀过滤的格式校验（40001）：禁止 ..（防穿越）、反斜杠、前导 /、超长。
+func validatePathFilter(p string) []model.ErrorDetail {
+	if p == "" {
+		return nil
+	}
+	if len(p) > 256 {
+		return []model.ErrorDetail{{Field: "path_filter", Issue: "length must be <= 256"}}
+	}
+	if strings.Contains(p, "..") {
+		return []model.ErrorDetail{{Field: "path_filter", Issue: "must not contain '..'"}}
+	}
+	if strings.Contains(p, "\\") {
+		return []model.ErrorDetail{{Field: "path_filter", Issue: "use '/' as path separator"}}
+	}
+	if strings.HasPrefix(p, "/") {
+		return []model.ErrorDetail{{Field: "path_filter", Issue: "must be a repo-relative prefix, not absolute path"}}
+	}
+	return nil
 }
 
 func (h *AskHandler) handleError(c *gin.Context, err error) {

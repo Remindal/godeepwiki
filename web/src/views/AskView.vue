@@ -90,8 +90,9 @@
           <input
             v-model="pathFilter"
             class="path-filter-input"
+            :class="{ invalid: pathFilterInvalid }"
             placeholder="限定目录（可留空）"
-            title="只在此路径前缀内检索，如 app/Services/ 或 routes/web.php"
+            :title="pathFilterInvalid || '只在此路径前缀内检索，如 app/Services/ 或 routes/web.php'"
             :disabled="streaming"
           />
           <el-select v-model="mode" size="small" class="mode-select" :disabled="streaming">
@@ -132,6 +133,17 @@ const convId = computed(() => (route.query.c as string) || 'default')
 const chat = computed(() => getChat(repoId.value, convId.value))
 const messages = computed(() => chat.value.messages)
 const streaming = computed(() => chat.value.streaming)
+
+// path_filter 前端即时校验（与后端 40001 规则一致）。
+const pathFilterInvalid = computed(() => {
+  const p = pathFilter.value
+  if (!p) return ''
+  if (p.includes('..')) return "不能包含 '..'"
+  if (p.includes('\\')) return '请用 / 作为路径分隔符'
+  if (p.startsWith('/')) return '请填仓库内相对路径，不要以 / 开头'
+  if (p.length > 256) return '过长（≤256）'
+  return ''
+})
 
 // 会话列表（当前仓库）。
 const convs = ref(listConversations(repoId.value))
@@ -188,7 +200,10 @@ async function scrollBottom() {
 
 function submit(question: string) {
   const q = question.trim()
-  if (!q || streaming.value) return
+  if (!q || streaming.value || pathFilterInvalid.value) {
+    if (pathFilterInvalid.value) ElMessage.warning(`目录格式：${pathFilterInvalid.value}`)
+    return
+  }
   input.value = ''
   localStorage.setItem(`dw_pathfilter_${repoId.value}`, pathFilter.value)
   void ask(repoId.value, convId.value, q, mode.value, pathFilter.value, scrollBottom)
@@ -333,6 +348,10 @@ async function openRef(r: Reference) {
   padding: 5px 8px;
 }
 .path-filter-input::placeholder { color: var(--dw-text-3); }
+.path-filter-input.invalid {
+  background: #f5f5f5;
+  outline: 1px solid #000;
+}
 .send-btn {
   width: 32px; height: 32px; border: none; border-radius: 50%;
   background: var(--dw-black); color: var(--dw-white);
