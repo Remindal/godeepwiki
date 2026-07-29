@@ -23,9 +23,14 @@ func staticSPA(dir string) gin.HandlerFunc {
 		// filepath.Clean("/"+p) 以 / 开头，Join 后必然落在 dir 内，天然防穿越（反 AI 错误 #11）。
 		full := filepath.Join(dir, filepath.Clean("/"+p))
 		if st, err := os.Stat(full); err == nil && !st.IsDir() {
+			// HTML 强制不缓存（避免发版后浏览器拿旧 bundle）；hash 资源可长缓存。
+			if filepath.Base(full) == "index.html" {
+				c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+			}
 			c.File(full)
 			return
 		}
+		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 		c.File(index)
 	}
 }
