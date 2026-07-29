@@ -61,15 +61,10 @@
       <section class="dw-card section">
         <h2>检索</h2>
         <div class="form-grid">
-          <label>默认模式</label>
-          <el-select v-model="form.retriever.mode">
-            <el-option label="hybrid 混合" value="hybrid" />
-            <el-option label="embedding 向量" value="embedding" />
-            <el-option label="keyword 关键词" value="keyword" />
-          </el-select>
           <label>Top K</label>
           <el-input-number v-model="form.retriever.top_k" :min="1" :max="30" />
         </div>
+        <div class="dw-faint dim-note">检索模式在问答输入框右侧逐次选择（hybrid / embedding / keyword）。</div>
         <el-button type="primary" :loading="saving === 'retriever'" @click="save('retriever')">保存</el-button>
       </section>
     </template>
@@ -127,7 +122,7 @@ async function save(section: 'llm' | 'embedding' | 'retriever') {
       const e = form.value.embedding
       patch.embedding = { provider: e.provider, model: e.model, base_url: e.base_url, batch_size: e.batch_size }
     } else {
-      patch.retriever = { mode: form.value.retriever.mode, top_k: form.value.retriever.top_k }
+      patch.retriever = { top_k: form.value.retriever.top_k }
     }
     const res = await api.put<{ version: number; restart_required: string[]; warnings: string[] }>('/api/v1/config', patch)
     version.value = res.version
