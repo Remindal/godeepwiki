@@ -75,12 +75,10 @@ func (p *amqpPublisher) ensureChannel() (*amqp.Channel, error) {
 	return ch, nil
 }
 
-// resetLocked 投递失败后重置：关 channel + 强断连接（下次投递自动重拨重建）。
+// resetLocked 投递失败后重置：丢弃 channel 引用 + 强断连接（下次投递自动重拨重建）。
+// 注意不调 ch.Close()——channel close-ok RPC 在半死连接上会永久阻塞（曾引发死锁）。
 func (p *amqpPublisher) resetLocked() {
-	if p.ch != nil {
-		_ = p.ch.Close()
-		p.ch = nil
-	}
+	p.ch = nil
 	p.conn.ForceClose()
 }
 
