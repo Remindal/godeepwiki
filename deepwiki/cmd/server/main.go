@@ -206,6 +206,7 @@ func main() {
 		Ready:     ready,
 		Snapshot:  snapshot,
 		Tasks:     tm,
+		Chunks:    chunkStore,
 		Bus:       bus,
 		Replayer:  bus,
 		Limiter:   limiter,

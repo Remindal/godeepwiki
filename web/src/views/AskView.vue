@@ -1,5 +1,13 @@
 <template>
   <div class="ask-page">
+    <div class="conv-bar">
+      <el-select :model-value="convId" size="small" class="conv-select" @change="switchConv">
+        <el-option v-for="c in convs" :key="c.id" :label="c.title" :value="c.id" />
+      </el-select>
+      <button class="conv-btn" title="新建对话" @click="newConv">＋</button>
+      <button class="conv-btn danger" title="删除当前对话" @click="removeConv(convId)">🗑</button>
+    </div>
+
     <div class="chat-area" ref="scrollEl">
       <div class="chat-inner">
         <div v-if="!messages.length" class="chat-empty">
@@ -37,7 +45,9 @@
                 </div>
                 <div v-show="m.refsOpen" class="refs-list">
                   <div v-for="r in m.references" :key="r.chunk_id" class="ref-item">
-                    <div class="ref-path">[{{ r.path }}:{{ r.start_line }}-{{ r.end_line }}]</div>
+                    <div class="ref-path clickable" title="点击查看完整代码" @click="openRef(r)">
+                      [{{ r.path }}:{{ r.start_line }}-{{ r.end_line }}]
+                    </div>
                     <div class="ref-snippet dw-faint">{{ r.snippet.slice(0, 160) }}…</div>
                   </div>
                 </div>
@@ -56,6 +66,16 @@
       <button class="clear-btn dw-faint" @click="clearHistory">清空对话</button>
     </div>
 
+    <el-drawer v-model="drawerOpen" :title="drawerChunk ? `${drawerChunk.path}:${drawerChunk.start_line}-${drawerChunk.end_line}` : '代码'" size="60%">
+      <div v-if="drawerLoading" class="dw-faint">加载中…</div>
+      <div v-else-if="drawerChunk" class="code-view">
+        <div v-for="l in drawerLines" :key="l.no" class="code-line">
+          <span class="line-no">{{ l.no }}</span>
+          <span class="line-text">{{ l.text || ' ' }}</span>
+        </div>
+      </div>
+    </el-drawer>
+
     <div class="input-bar">
       <div class="input-inner dw-card">
         <textarea
@@ -72,9 +92,8 @@
             <el-option label="向量检索" value="embedding" />
             <el-option label="关键词检索" value="keyword" />
           </el-select>
-          <button class="send-btn" :disabled="!input.trim() || streaming" @click="submit(input)">
-            {{ streaming ? '…' : '↑' }}
-          </button>
+          <button v-if="streaming" class="send-btn stop" title="停止生成" @click="stop">■</button>
+          <button v-else class="send-btn" :disabled="!input.trim()" @click="submit(input)">↑</button>
         </div>
       </div>
     </div>
@@ -82,22 +101,57 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { marked } from 'marked'
-import { ask, clearChat, getChat, type ChatMsg } from '../stores/chat'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  ask, clearChat, createConversation, deleteConversation, getChat,
+  listConversations, stopChat, type ChatMsg,
+} from '../stores/chat'
+import { api } from '../api/client'
+import type { Reference } from '../api/types'
 
 const route = useRoute()
+const router = useRouter()
 const input = ref('')
 const mode = ref('hybrid')
 const scrollEl = ref<HTMLElement>()
 
-// repoId 跟随路由参数响应式变化（/ask/A → /ask/B 组件复用时 setup 不重跑）。
+// repoId 跟随路由参数响应式变化；convId 跟随 query.c（默认 default）。
 const repoId = computed(() => route.params.repoId as string)
-// 会话来自模块级仓库：离开页面流式在后台续跑，回来接着看（市面 AI 对话行为）。
-const chat = computed(() => getChat(repoId.value))
+const convId = computed(() => (route.query.c as string) || 'default')
+const chat = computed(() => getChat(repoId.value, convId.value))
 const messages = computed(() => chat.value.messages)
 const streaming = computed(() => chat.value.streaming)
+
+// 会话列表（当前仓库）。
+const convs = ref(listConversations(repoId.value))
+watch(repoId, () => {
+  convs.value = listConversations(repoId.value)
+})
+watch(convId, () => {
+  convs.value = listConversations(repoId.value)
+})
+
+function switchConv(id: string) {
+  router.push({ query: id === 'default' ? {} : { c: id } })
+}
+function newConv() {
+  const meta = createConversation(repoId.value)
+  convs.value = listConversations(repoId.value)
+  switchConv(meta.id)
+}
+async function removeConv(id: string) {
+  try {
+    await ElMessageBox.confirm('删除这个对话及其历史记录？', '确认删除', { type: 'warning' })
+  } catch {
+    return
+  }
+  deleteConversation(repoId.value, id)
+  convs.value = listConversations(repoId.value)
+  if (convId.value === id) switchConv(convs.value[0]?.id ?? 'default')
+}
 
 const hints = ['这个仓库是干什么的？', '核心入口函数在哪里？', '路由是怎么注册和匹配的？']
 
@@ -109,7 +163,7 @@ function renderMd(text: string) {
 const nowTs = ref(Date.now())
 let ticker: number | undefined
 function elapsed(m: ChatMsg): number {
-  void nowTs.value // 依赖追踪：每秒触发一次重算
+  void nowTs.value
   return m.startedAt ? Math.max(0, Math.floor((Date.now() - m.startedAt) / 1000)) : 0
 }
 onMounted(() => {
@@ -128,12 +182,42 @@ function submit(question: string) {
   const q = question.trim()
   if (!q || streaming.value) return
   input.value = ''
-  // fire-and-forget：组件只负责发起与滚动，生命周期不影响后台续跑。
-  void ask(repoId.value, q, mode.value, scrollBottom)
+  void ask(repoId.value, convId.value, q, mode.value, scrollBottom)
+}
+
+function stop() {
+  stopChat(repoId.value, convId.value)
 }
 
 function clearHistory() {
-  clearChat(repoId.value)
+  clearChat(repoId.value, convId.value)
+}
+
+// 引用代码查看器（drawer）：点引用按 chunk_id 取全文带行号展示。
+const drawerOpen = ref(false)
+const drawerLoading = ref(false)
+const drawerChunk = ref<{ path: string; start_line: number; end_line: number; language: string; content: string } | null>(null)
+
+const drawerLines = computed(() => {
+  if (!drawerChunk.value) return []
+  return drawerChunk.value.content.split('\n').map((text, i) => ({
+    no: drawerChunk.value!.start_line + i,
+    text,
+  }))
+})
+
+async function openRef(r: Reference) {
+  drawerOpen.value = true
+  drawerLoading.value = true
+  drawerChunk.value = null
+  try {
+    drawerChunk.value = await api.get(`/api/v1/chunks/${r.chunk_id}`)
+  } catch {
+    ElMessage.error('加载代码块失败')
+    drawerOpen.value = false
+  } finally {
+    drawerLoading.value = false
+  }
 }
 </script>
 
@@ -235,4 +319,38 @@ function clearHistory() {
   display: flex; align-items: center; justify-content: center;
 }
 .send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.send-btn.stop { background: var(--dw-black); font-size: 12px; }
+
+.conv-bar {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 14px 20px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.conv-select { width: 220px; }
+.conv-btn {
+  width: 28px; height: 28px;
+  border: 1px solid var(--dw-border); border-radius: 8px;
+  background: var(--dw-white); cursor: pointer; font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+}
+.conv-btn:hover { box-shadow: var(--dw-shadow); }
+.conv-btn.danger:hover { color: #000; }
+
+.ref-path.clickable { cursor: pointer; }
+.ref-path.clickable:hover { text-decoration: underline; }
+
+.code-view { font-family: ui-monospace, 'SF Mono', Consolas, monospace; font-size: 12.5px; line-height: 1.6; }
+.code-line { display: flex; white-space: pre; }
+.line-no {
+  flex-shrink: 0;
+  width: 48px;
+  text-align: right;
+  padding-right: 12px;
+  color: var(--dw-text-3);
+  user-select: none;
+}
+.line-text { flex: 1; }
 </style>

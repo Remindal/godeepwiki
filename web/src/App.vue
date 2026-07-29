@@ -28,14 +28,14 @@
         <div class="history-list">
           <div
             v-for="h in histories"
-            :key="h.repoId"
+            :key="h.repoId + ':' + h.convId"
             class="history-item"
-            :class="{ active: route.params.repoId === h.repoId }"
-            @click="$router.push(`/ask/${h.repoId}`)"
+            :class="{ active: route.params.repoId === h.repoId && (route.query.c || 'default') === h.convId }"
+            @click="$router.push(h.convId === 'default' ? `/ask/${h.repoId}` : `/ask/${h.repoId}?c=${h.convId}`)"
           >
             <div class="history-preview">{{ h.preview || '（空对话）' }}</div>
             <div class="history-meta dw-faint">
-              {{ repoName(h.repoId) }} · {{ h.count }} 条 · {{ formatTime(h.updatedAt) }}
+              {{ repoName(h.repoId) }} · {{ formatTime(h.updatedAt) }}
             </div>
           </div>
         </div>

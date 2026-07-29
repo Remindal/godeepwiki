@@ -30,6 +30,7 @@ type Deps struct {
 	Ready     *atomic.Bool
 	Snapshot  *handler.HealthSnapshot // 60s 后台探测快照（health 毫秒级返回的数据源）
 	Tasks     task.TaskManager
+	Chunks    store.ChunkStore // chunks 查询（前端引用查看器）
 	Bus       eventbus.EventBus
 	Replayer  eventbus.Replayer     // 与 Bus 同实例（Redis Streams 回放）
 	Limiter   ratelimit.Limiter     // Redis Lua 滑动窗口 + 降级兜底（硬约束 #1）
@@ -68,6 +69,7 @@ func NewRouter(d Deps) *gin.Engine {
 	askH := handler.NewAskHandler(d.AskSvc, d.Logger)
 	wikiH := handler.NewWikiHandler(d.WikiSvc, d.Logger)
 	configH := handler.NewConfigHandler(d.Cfg, d.Logger)
+	chunkH := handler.NewChunkHandler(d.Chunks, d.Logger)
 	eventH := handler.NewEventHandler(d.Bus, d.Replayer, cfg.Server.CORSAllowedOrigins, d.Logger)
 	rateLimiter := middleware.NewRateLimiter(d.Cfg, d.Limiter, d.Logger)
 
@@ -90,6 +92,7 @@ func NewRouter(d Deps) *gin.Engine {
 		v1.POST("/wiki/generate", wikiH.Generate)                  // 13
 		v1.GET("/repos/:repo_id/wiki", wikiH.GetWiki)              // 14
 		v1.GET("/repos/:repo_id/wiki/export", wikiH.Export)       // 14b wiki 导出下载
+		v1.GET("/chunks/:chunk_id", chunkH.Get)                   // 14c chunk 全文（引用查看器）
 		v1.GET("/config", configH.GetConfig)                       // 15
 		v1.PUT("/config", middleware.AdminOnly(), configH.UpdateConfig) // 16
 		v1.GET("/events", eventH.Events)                           // 17

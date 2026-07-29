@@ -3,9 +3,6 @@ import { ElMessage } from 'element-plus'
 import { streamSSE, ApiError } from '../api/client'
 import type { Reference } from '../api/types'
 
-// historiesVersion 历史列表版本号：saveHistory 时递增，侧栏 watch 它刷新「历史对话」栏目。
-export const historiesVersion = ref(0)
-
 export interface ChatMsg {
   role: 'user' | 'ai'
   content: string
@@ -16,7 +13,7 @@ export interface ChatMsg {
   refsOpen?: boolean
   usage?: { prompt_tokens: number; completion_tokens: number }
   latency_ms?: number
-  startedAt?: number // 流式开始时刻（“已思考 N 秒”展示用）
+  startedAt?: number
 }
 
 export interface ChatSession {
@@ -25,18 +22,95 @@ export interface ChatSession {
   abort?: () => void
 }
 
-// 会话仓库：模块级单例，不随路由组件销毁——离开页面流式继续在后台跑（市面 AI 对话行为）。
+export interface ConvMeta {
+  id: string
+  title: string
+  updatedAt: number
+}
+
+// historiesVersion 历史列表版本号：保存/清空/新建/删除会话时递增，侧栏据此刷新。
+export const historiesVersion = ref(0)
+
 const sessions = reactive(new Map<string, ChatSession>())
-
 const CHAT_MAX = 50
-const chatKey = (repoId: string) => `dw_chat_${repoId}`
+const DEFAULT_CONV = 'default'
 
-function loadHistory(repoId: string): ChatMsg[] {
+const convsKey = (repoId: string) => `dw_convs_${repoId}`
+const chatKey = (repoId: string, convId: string) =>
+  convId === DEFAULT_CONV ? `dw_chat_${repoId}` : `dw_chat_${repoId}_${convId}`
+
+// ---------------- 会话索引（每仓库一份） ----------------
+
+function loadConvs(repoId: string): ConvMeta[] {
   try {
-    const raw = localStorage.getItem(chatKey(repoId))
+    const raw = localStorage.getItem(convsKey(repoId))
+    if (raw) {
+      const list = JSON.parse(raw) as ConvMeta[]
+      if (Array.isArray(list)) return list
+    }
+  } catch { /* fallthrough */ }
+  // 迁移：旧版单会话 dw_chat_<repoId> 存在时补一条默认会话索引。
+  if (localStorage.getItem(chatKey(repoId, DEFAULT_CONV))) {
+    return [{ id: DEFAULT_CONV, title: '默认对话', updatedAt: Date.now() }]
+  }
+  return []
+}
+
+function saveConvs(repoId: string, convs: ConvMeta[]) {
+  localStorage.setItem(convsKey(repoId), JSON.stringify(convs))
+  historiesVersion.value++
+}
+
+export function listConversations(repoId: string): ConvMeta[] {
+  const convs = loadConvs(repoId)
+  if (!convs.length) {
+    const meta: ConvMeta = { id: DEFAULT_CONV, title: '默认对话', updatedAt: Date.now() }
+    saveConvs(repoId, [meta])
+    return [meta]
+  }
+  return convs.slice().sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+export function createConversation(repoId: string): ConvMeta {
+  const convs = loadConvs(repoId)
+  const meta: ConvMeta = {
+    id: `c${Date.now().toString(36)}`,
+    title: '新对话',
+    updatedAt: Date.now(),
+  }
+  convs.push(meta)
+  saveConvs(repoId, convs)
+  return meta
+}
+
+export function deleteConversation(repoId: string, convId: string) {
+  const s = sessions.get(`${repoId}:${convId}`)
+  s?.abort?.()
+  sessions.delete(`${repoId}:${convId}`)
+  localStorage.removeItem(chatKey(repoId, convId))
+  const convs = loadConvs(repoId).filter((c) => c.id !== convId)
+  saveConvs(repoId, convs)
+}
+
+function touchConversation(repoId: string, convId: string, title?: string) {
+  const convs = loadConvs(repoId)
+  const meta = convs.find((c) => c.id === convId)
+  if (meta) {
+    meta.updatedAt = Date.now()
+    if (title && (meta.title === '新对话' || meta.title === '默认对话')) meta.title = title
+  } else {
+    convs.push({ id: convId, title: title ?? '新对话', updatedAt: Date.now() })
+  }
+  saveConvs(repoId, convs)
+}
+
+// ---------------- 消息持久化 ----------------
+
+function loadMessages(repoId: string, convId: string): ChatMsg[] {
+  try {
+    const raw = localStorage.getItem(chatKey(repoId, convId))
     if (!raw) return []
     const parsed = JSON.parse(raw)
-    // 兼容两种格式：{updatedAt, messages} 与旧版纯数组。
     const list: ChatMsg[] = Array.isArray(parsed) ? parsed : parsed?.messages ?? []
     return Array.isArray(list) ? list : []
   } catch {
@@ -44,7 +118,7 @@ function loadHistory(repoId: string): ChatMsg[] {
   }
 }
 
-function saveHistory(repoId: string, list: ChatMsg[]) {
+function saveMessages(repoId: string, convId: string, list: ChatMsg[]) {
   try {
     const finalized = list
       .filter((m) => !m.streaming)
@@ -58,65 +132,64 @@ function saveHistory(repoId: string, list: ChatMsg[]) {
         latency_ms: m.latency_ms,
       }))
     localStorage.setItem(
-      chatKey(repoId),
+      chatKey(repoId, convId),
       JSON.stringify({ updatedAt: Date.now(), messages: finalized }),
     )
-    historiesVersion.value++
+    const firstUser = finalized.find((m) => m.role === 'user')
+    touchConversation(repoId, convId, firstUser?.content?.slice(0, 30))
   } catch { /* 存储满等异常静默 */ }
 }
 
-// ChatHistoryEntry 侧栏「历史对话」条目。
+// ---------------- 会话存取 ----------------
+
+export function getChat(repoId: string, convId: string = DEFAULT_CONV): ChatSession {
+  const key = `${repoId}:${convId}`
+  let s = sessions.get(key)
+  if (!s) {
+    s = reactive<ChatSession>({ messages: loadMessages(repoId, convId), streaming: false })
+    sessions.set(key, s)
+  }
+  return s
+}
+
+export function clearChat(repoId: string, convId: string = DEFAULT_CONV) {
+  const s = getChat(repoId, convId)
+  s.abort?.()
+  s.messages = []
+  s.streaming = false
+  localStorage.removeItem(chatKey(repoId, convId))
+  touchConversation(repoId, convId)
+}
+
+// ---------------- 侧栏历史索引 ----------------
+
 export interface ChatHistoryEntry {
   repoId: string
-  preview: string // 首条用户消息（截断）
-  count: number
+  convId: string
+  preview: string
   updatedAt: number
 }
 
-// listChatHistories 扫描 localStorage 中的全部会话（dw_chat_*），按最近更新倒序。
+// listChatHistories 扫描全部仓库的会话索引（dw_convs_*），按最近更新倒序。
 export function listChatHistories(): ChatHistoryEntry[] {
   const out: ChatHistoryEntry[] = []
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i)
-    if (!key || !key.startsWith('dw_chat_')) continue
+    if (!key || !key.startsWith('dw_convs_')) continue
     try {
-      const raw = JSON.parse(localStorage.getItem(key) || '')
-      const msgs: ChatMsg[] = Array.isArray(raw) ? raw : raw?.messages ?? []
-      if (!msgs.length) continue
-      const firstUser = msgs.find((m) => m.role === 'user')
-      out.push({
-        repoId: key.slice('dw_chat_'.length),
-        preview: (firstUser?.content ?? '').slice(0, 40),
-        count: msgs.length,
-        updatedAt: Array.isArray(raw) ? 0 : raw.updatedAt ?? 0,
-      })
+      const convs = JSON.parse(localStorage.getItem(key) || '[]') as ConvMeta[]
+      const repoId = key.slice('dw_convs_'.length)
+      for (const c of convs) {
+        out.push({ repoId, convId: c.id, preview: c.title, updatedAt: c.updatedAt })
+      }
     } catch { /* 跳过坏数据 */ }
   }
   out.sort((a, b) => b.updatedAt - a.updatedAt)
   return out
 }
 
-export function getChat(repoId: string): ChatSession {
-  let s = sessions.get(repoId)
-  if (!s) {
-    s = reactive<ChatSession>({ messages: loadHistory(repoId), streaming: false })
-    sessions.set(repoId, s)
-  }
-  return s
-}
+// ---------------- 流式问答 ----------------
 
-export function clearChat(repoId: string) {
-  const s = getChat(repoId)
-  s.abort?.()
-  s.messages = []
-  s.streaming = false
-  localStorage.removeItem(chatKey(repoId))
-  historiesVersion.value++
-}
-
-// typewriterPacer 打字机节流：provider 常常「沉默思考十几秒 → 几百字一秒内灌完」，
-// 直接渲染等于「一下全弹出」。把到达的 delta 入队，按 ~66 字/秒匀速放出，
-// 体感接近市面 AI 的逐字输出。timer 挂 window，与组件生命周期无关。
 function typewriterPacer(ai: ChatMsg, onUpdate?: () => void) {
   let pending = ''
   let timer: number | undefined
@@ -146,15 +219,18 @@ function typewriterPacer(ai: ChatMsg, onUpdate?: () => void) {
   return { push, flush }
 }
 
-// ask 在会话仓库层发起流式请求；调用方（组件）只负责渲染与滚动。
-// onUpdate 在每帧后回调（组件用来滚到底部），组件卸载后传 null 也不影响后台续跑。
+export function stopChat(repoId: string, convId: string = DEFAULT_CONV) {
+  getChat(repoId, convId).abort?.()
+}
+
 export async function ask(
   repoId: string,
+  convId: string,
   question: string,
   mode: string,
   onUpdate?: () => void,
 ): Promise<void> {
-  const s = getChat(repoId)
+  const s = getChat(repoId, convId)
   const q = question.trim()
   if (!q || s.streaming) return
 
@@ -168,11 +244,10 @@ export async function ask(
     role: 'ai', content: '', thinking: '', streaming: true, refsOpen: false, thinkingOpen: false,
     startedAt: Date.now(),
   })
-  // 必须经响应式代理访问（数组下标经 Proxy 包装）：直接改原始对象不会触发重渲染，
-  // 曾导致“停留在思考中、切走再回来才显示”的问题。
+  // 必须经响应式代理访问（数组下标经 Proxy 包装），否则流式变更不触发重渲染。
   const ai = s.messages[s.messages.length - 1]
   s.streaming = true
-  saveHistory(repoId, s.messages)
+  saveMessages(repoId, convId, s.messages)
   onUpdate?.()
 
   const pacer = typewriterPacer(ai, onUpdate)
@@ -186,7 +261,6 @@ export async function ask(
           ai.references = payload.references
           onUpdate?.()
         } else if (frame.event === 'thinking') {
-          // 推理段直接追加（折叠区，不走打字机）。
           ai.thinking = (ai.thinking || '') + payload.delta
           onUpdate?.()
         } else if (frame.event === 'token') {
@@ -213,7 +287,7 @@ export async function ask(
   } catch (e) {
     ai.streaming = false
     if ((e as Error).name === 'AbortError') {
-      // 显式停止：静默收尾，保留已生成内容。
+      // 显式停止/离开：静默收尾，保留已生成内容。
     } else if (e instanceof ApiError) {
       ai.content = `出错了：${e.message}`
       ElMessage.error(ai.content)
@@ -224,7 +298,7 @@ export async function ask(
   } finally {
     s.streaming = false
     s.abort = undefined
-    saveHistory(repoId, s.messages)
+    saveMessages(repoId, convId, s.messages)
     onUpdate?.()
   }
 }
