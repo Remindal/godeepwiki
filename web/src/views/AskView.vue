@@ -88,11 +88,11 @@
         />
         <div class="input-side">
           <span class="pf-wrap">
-            <span v-if="pathFilterInvalid" class="pf-tip">{{ pathFilterInvalid }}</span>
+            <span v-if="pathTip" class="pf-tip">{{ pathTip }}</span>
             <input
               v-model="pathFilter"
               class="path-filter-input"
-              :class="{ invalid: pathFilterInvalid }"
+              :class="{ invalid: !!pathTip }"
               placeholder="限定目录（可留空）"
               title="只在此路径前缀内检索，如 app/Services/ 或 routes/web.php"
               :disabled="streaming"
@@ -137,7 +137,7 @@ const chat = computed(() => getChat(repoId.value, convId.value))
 const messages = computed(() => chat.value.messages)
 const streaming = computed(() => chat.value.streaming)
 
-// path_filter 前端即时校验（与后端 40001 规则一致）。
+// path_filter 校验：先本地格式校验，合法则去抖 500ms 调后端做仓库内存在性校验。
 const pathFilterInvalid = computed(() => {
   const p = pathFilter.value
   if (!p) return ''
@@ -145,6 +145,36 @@ const pathFilterInvalid = computed(() => {
   if (p.includes('\\')) return '请用 / 作为路径分隔符'
   if (p.startsWith('/')) return '请填仓库内相对路径，不要以 / 开头'
   if (p.length > 256) return '过长（≤256）'
+  return ''
+})
+
+const pathStatus = ref<'ok' | 'checking' | 'missing'>('ok')
+let pathCheckTimer: number | undefined
+watch([pathFilter, repoId], () => {
+  pathStatus.value = 'ok'
+  clearTimeout(pathCheckTimer)
+  const p = pathFilter.value.trim()
+  if (!p || pathFilterInvalid.value) return
+  pathCheckTimer = window.setTimeout(async () => {
+    pathStatus.value = 'checking'
+    try {
+      const res = await api.get<{ exists: boolean }>(
+        `/api/v1/repos/${repoId.value}/paths/exists?prefix=${encodeURIComponent(p)}`,
+      )
+      // 期间输入又变了则丢弃本次结果
+      if (pathFilter.value.trim() === p) {
+        pathStatus.value = res.exists ? 'ok' : 'missing'
+      }
+    } catch {
+      pathStatus.value = 'ok' // 校验接口失败不阻塞输入
+    }
+  }, 500)
+})
+
+const pathTip = computed(() => {
+  if (pathFilterInvalid.value) return pathFilterInvalid.value
+  if (pathFilter.value.trim() && pathStatus.value === 'checking') return '校验中…'
+  if (pathFilter.value.trim() && pathStatus.value === 'missing') return '仓库中不存在该路径'
   return ''
 })
 
@@ -203,8 +233,8 @@ async function scrollBottom() {
 
 function submit(question: string) {
   const q = question.trim()
-  if (!q || streaming.value || pathFilterInvalid.value) {
-    if (pathFilterInvalid.value) ElMessage.warning(`目录格式：${pathFilterInvalid.value}`)
+  if (!q || streaming.value || pathFilterInvalid.value || pathStatus.value === 'missing') {
+    if (pathTip.value) ElMessage.warning(`目录：${pathTip.value}`)
     return
   }
   input.value = ''

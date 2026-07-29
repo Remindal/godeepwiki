@@ -93,6 +93,7 @@ func NewRouter(d Deps) *gin.Engine {
 		v1.GET("/repos/:repo_id/wiki", wikiH.GetWiki)              // 14
 		v1.GET("/repos/:repo_id/wiki/export", wikiH.Export)       // 14b wiki 导出下载
 		v1.GET("/chunks/:chunk_id", chunkH.Get)                   // 14c chunk 全文（引用查看器）
+		v1.GET("/repos/:repo_id/paths/exists", chunkH.PathExists) // 14d 路径前缀存在性校验
 		v1.GET("/config", configH.GetConfig)                       // 15
 		v1.PUT("/config", middleware.AdminOnly(), configH.UpdateConfig) // 16
 		v1.GET("/events", eventH.Events)                           // 17
