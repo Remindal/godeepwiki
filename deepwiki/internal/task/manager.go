@@ -246,15 +246,14 @@ func (m *Manager) Cancel(ctx context.Context, taskID string) error {
 		return err
 	}
 
-	// pending 任务直接置为 cancelled，避免后续消息消费时再执行。
-	if t.State == model.TaskStatePending {
-		now := time.Now().UTC()
-		if err := m.store.UpdateState(ctx, taskID, model.TaskPatch{
-			State:      ptrState(model.TaskStateCancelled),
-			FinishedAt: &now,
-		}); err != nil {
-			return err
-		}
+	// 立即置 cancelled（pending 与 running 一致处理）：用户即时可见终态；
+	// 执行器随后经 ctx 取消中止，其后续 UpdateState 因终态被拒而静默忽略（幂等）。
+	now := time.Now().UTC()
+	if err := m.store.UpdateState(ctx, taskID, model.TaskPatch{
+		State:      ptrState(model.TaskStateCancelled),
+		FinishedAt: &now,
+	}); err != nil {
+		return err
 	}
 
 	m.mu.Lock()
