@@ -17,6 +17,33 @@
 - **前端**：Vue 3 + Element Plus，黑白 iOS 圆角风格；设置页改模型/检索参数（密钥仅环境变量注入）
 - **工程化**：RabbitMQ 任务队列（重试链 + 死信 + 崩溃恢复 + 消费看门狗）、Redis Streams 事件总线（SSE/WS 推送 + 断线回放）、两级限流、API Key 鉴权（可开关，空配置为 dev 模式）、etcd 配置热更新、Prometheus 指标、OTel 链路
 
+## 技术借鉴：对标主流 Agent/RAG 框架的写法
+
+仓库摄取存储与检索链路在设计上逐项仿照了成熟框架的经过验证的模式，并用 Go 重新实现：
+
+**仓库拉取与存储**
+
+| 本项目做法 | 借鉴来源 |
+|---|---|
+| git 浅克隆拉取仓库，失败降级 tarball 镜像下载 | DeepWiki（AsyncFuncAI）的仓库预处理流程 |
+| `include_ext` / `exclude_dirs` 文件过滤解析 | LlamaIndex `SimpleDirectoryReader` 的文件筛选规则 |
+| **父子块双层索引**：小「子块」做向量/BM25 检索入口，命中后回「父块」取完整函数级上下文 | LangChain `ParentDocumentRetriever`（Parent Document Retrieval 模式） |
+| 向量（pgvector HNSW）与 BM25（OpenSearch）双路索引分写 | LangChain / LlamaIndex 的 vector store + keyword index 分工 |
+| FileHashes diff 增量刷新，只重做变更文件 | LlamaIndex ingestion pipeline / CocoIndex 的增量更新 |
+
+**检索与问答**
+
+| 本项目做法 | 借鉴来源 |
+|---|---|
+| Multi-Query：LLM 改写 3 路等价查询并行召回、合并加权 | LangChain `MultiQueryRetriever` |
+| BM25 + 向量双路召回，RRF（Reciprocal Rank Fusion）融合排序 | LangChain `EnsembleRetriever`（默认即 RRF） |
+| 召回后 LLM 精排（两阶段：粗排 + rerank） | RAG 通用两阶段检索（Cohere Rerank / cross-encoder 同构） |
+| `path_filter` 按路径前缀做元数据过滤 | LangChain / LlamaIndex 的 metadata filtering |
+| 引用必须来自真实检索结果（禁止模型杜撰出处） | RAG grounding / citation 约束（DeepWiki、Perplexity 风格引用） |
+| SSE 流式 + 思维链（reasoning_content）折叠展示 | DeepSeek-R1 系 thinking 模型的 agent 交互范式 |
+
+与框架的差异：不依赖 LangChain/LlamaIndex 运行时，上述模式全部以 Go 在 `internal/retriever`、`internal/ingest` 内自研实现，并叠加了企业级工程化（任务队列、熔断降级、断点续跑、对账重建）。
+
 ## 技术栈
 
 | 层 | 选型 |
