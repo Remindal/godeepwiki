@@ -39,7 +39,8 @@ func NewEventHandler(bus eventbus.EventBus, replayer eventbus.Replayer, allowedO
 }
 
 // wsOriginChecker 按 server.cors_allowed_origins 白名单校验 WS Origin（硬约束 #12）。
-// 无 Origin 头（非浏览器客户端）放行；白名单为空（dev 未配置）放行。
+// 无 Origin 头（非浏览器客户端）放行；白名单为空（dev 未配置）放行；
+// 同源请求（Origin 的 host 与请求 host 一致，如前后端同端口部署）恒放行。
 func wsOriginChecker(allowed []string) func(r *http.Request) bool {
 	whitelist := make(map[string]struct{}, len(allowed))
 	for _, o := range allowed {
@@ -50,8 +51,12 @@ func wsOriginChecker(allowed []string) func(r *http.Request) bool {
 		if origin == "" || len(whitelist) == 0 {
 			return true
 		}
-		_, ok := whitelist[strings.ToLower(origin)]
-		return ok
+		lower := strings.ToLower(origin)
+		if _, ok := whitelist[lower]; ok {
+			return true
+		}
+		// 同源放行：前后端同端口托管时 Origin 与 Host 一致。
+		return strings.HasSuffix(lower, "://"+strings.ToLower(r.Host))
 	}
 }
 
