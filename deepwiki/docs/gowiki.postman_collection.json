@@ -1,0 +1,182 @@
+{
+  "info": {
+    "name": "GoWiki API v1",
+    "description": "GoWiki（DeepWiki 复刻）API 集合。与 docs/API.md 对应。dev 模式（auth.api_keys 为空）下 api_key 变量留空即可。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8080" },
+    { "key": "api_key", "value": "" },
+    { "key": "repo_id", "value": "" },
+    { "key": "task_id", "value": "" },
+    { "key": "chunk_id", "value": "" }
+  ],
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key", "value": "X-API-Key" },
+      { "key": "value", "value": "{{api_key}}" },
+      { "key": "in", "value": "header" }
+    ]
+  },
+  "item": [
+    {
+      "name": "系统",
+      "item": [
+        {
+          "name": "健康检查",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/health", "auth": { "type": "noauth" } }
+        },
+        {
+          "name": "Prometheus 指标",
+          "request": { "method": "GET", "url": "{{base_url}}/metrics", "auth": { "type": "noauth" } }
+        }
+      ]
+    },
+    {
+      "name": "仓库",
+      "item": [
+        {
+          "name": "摄取仓库",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/ingest",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"repo_url\": \"https://github.com/sirupsen/logrus\",\n  \"branch\": \"\",\n  \"auto_wiki\": false\n}" },
+            "description": "202 返回 task_id/repo_id。已摄取返回 40901（details 含 existing_repo_id）。"
+          }
+        },
+        {
+          "name": "仓库列表",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/repos?page=1&page_size=20" }
+        },
+        {
+          "name": "仓库详情",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/repos/{{repo_id}}" }
+        },
+        {
+          "name": "删除仓库",
+          "request": { "method": "DELETE", "url": "{{base_url}}/api/v1/repos/{{repo_id}}" }
+        },
+        {
+          "name": "增量刷新",
+          "request": { "method": "POST", "url": "{{base_url}}/api/v1/repos/{{repo_id}}/refresh" }
+        },
+        {
+          "name": "路径前缀存在性校验",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/repos/{{repo_id}}/paths/exists?prefix=internal/" }
+        }
+      ]
+    },
+    {
+      "name": "任务",
+      "item": [
+        {
+          "name": "任务列表",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/tasks?page=1&page_size=20" }
+        },
+        {
+          "name": "任务详情",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/tasks/{{task_id}}" }
+        },
+        {
+          "name": "取消任务",
+          "request": { "method": "DELETE", "url": "{{base_url}}/api/v1/tasks/{{task_id}}" }
+        }
+      ]
+    },
+    {
+      "name": "问答",
+      "item": [
+        {
+          "name": "同步问答",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/ask",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"repo_id\": \"{{repo_id}}\",\n  \"question\": \"这个仓库是干什么的？\",\n  \"mode\": \"hybrid\",\n  \"top_k\": 5\n}" },
+            "description": "mode ∈ keyword|embedding|hybrid；支持 path_filter/history。hybrid 模式首 token 前有多查询改写，延迟较高属正常。"
+          }
+        },
+        {
+          "name": "流式问答（SSE）",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/ask/stream",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"repo_id\": \"{{repo_id}}\",\n  \"question\": \"Entry 是如何输出日志的？\",\n  \"mode\": \"hybrid\"\n}" },
+            "description": "SSE：references → thinking → token → done。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Wiki",
+      "item": [
+        {
+          "name": "生成 Wiki",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/wiki/generate",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"repo_id\": \"{{repo_id}}\"\n}" },
+            "description": "202 派发 wiki 任务；已有进行中任务返回 40902。支持断点续跑。"
+          }
+        },
+        {
+          "name": "获取 Wiki",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/repos/{{repo_id}}/wiki" }
+        },
+        {
+          "name": "导出 Wiki Markdown",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/repos/{{repo_id}}/wiki/export" }
+        }
+      ]
+    },
+    {
+      "name": "Chunk 与配置",
+      "item": [
+        {
+          "name": "查看 Chunk 原文",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/chunks/{{chunk_id}" },
+            "description": "注意：响应字段为 PascalCase（代码事实）。"
+        },
+        {
+          "name": "读取配置",
+          "request": { "method": "GET", "url": "{{base_url}}/api/v1/config" }
+        },
+        {
+          "name": "热更新配置（admin）",
+          "request": {
+            "method": "PUT",
+            "url": "{{base_url}}/api/v1/config",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"retriever\": { \"mode\": \"hybrid\", \"top_k\": 8 }\n}" },
+            "description": "需 admin key，否则 40301。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "实时事件",
+      "item": [
+        {
+          "name": "SSE 事件流",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/v1/events?types=task.state_changed",
+            "description": "建议用 Postman 的 Server-Sent Events 请求类型调试；支持 Last-Event-ID 回放。"
+          }
+        },
+        {
+          "name": "WebSocket 事件流",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/v1/ws",
+            "description": "建议用 Postman 的 WebSocket 请求类型连接 ws://localhost:8080/api/v1/ws?resume_from=0。"
+          }
+        }
+      ]
+    }
+  ]
+}
