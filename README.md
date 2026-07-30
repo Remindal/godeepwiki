@@ -10,11 +10,12 @@
 ## 功能一览
 
 - **仓库摄取**：git clone（失败自动降级 tarball 镜像下载），自定义 include/exclude 规则，进度按阶段权重推进
-- **代码问答**：混合检索（BM25 + 向量 RRF 融合 + 代码权重 + LLM rerank），多轮上下文，流式输出（打字机节奏），引用来源可展开
+- **代码问答**：五层检索栈（Multi-Query 查询改写 → LLM rerank → BM25+向量 RRF 混合 → 代码权重），多轮上下文，流式输出（打字机节奏），`path_filter` 目录级过滤（含存在性校验），引用可点开看完整代码
+- **多会话**：每仓库可开多个并列对话，历史侧栏直达，离开页面后台续跑，可中途停止生成
 - **增量刷新**：FileHashes diff，只重新索引变更文件
-- **Wiki 生成**：LLM 生成目录 + 逐页 markdown，断点续跑，单文件导出下载
-- **前端**：Vue 3 + Element Plus，黑白 iOS 圆角风格，会话历史/后台续跑/历史对话侧栏
-- **工程化**：RabbitMQ 任务队列（重试链 + 死信 + 崩溃恢复）、Redis Streams 事件总线（SSE/WS 推送 + 断线回放）、两级限流、API Key 鉴权、etcd 配置热更新、Prometheus 指标、OTel 链路
+- **Wiki 生成**：全量文件树驱动目录 + Mermaid 架构图渲染，断点续跑，单文件导出下载
+- **前端**：Vue 3 + Element Plus，黑白 iOS 圆角风格；设置页改模型/检索参数（密钥仅环境变量注入）
+- **工程化**：RabbitMQ 任务队列（重试链 + 死信 + 崩溃恢复 + 消费看门狗）、Redis Streams 事件总线（SSE/WS 推送 + 断线回放）、两级限流、API Key 鉴权（可开关，空配置为 dev 模式）、etcd 配置热更新、Prometheus 指标、OTel 链路
 
 ## 技术栈
 
@@ -72,8 +73,10 @@ npm run dev        # http://localhost:5173，/api 自动代理到 8080
 | POST | `/api/v1/ask` | `{repo_id 或 repo_url, question, mode?, top_k?, path_filter?, history?}` → 答案 + 引用 |
 | POST | `/api/v1/ask/stream` | SSE 流式：references → thinking/token → done |
 | POST | `/api/v1/wiki/generate` | `{repo_id}` → 202（生成中去重提示 40902） |
-| GET | `/api/v1/repos/{id}/wiki` | 目录 + 页面 markdown |
+| GET | `/api/v1/repos/{id}/wiki` | 目录 + 页面 markdown（含 Mermaid 图） |
 | GET | `/api/v1/repos/{id}/wiki/export` | wiki 单文件下载 |
+| GET | `/api/v1/chunks/{id}` | 按 chunk_id 取代码块全文（引用查看器） |
+| GET | `/api/v1/repos/{id}/paths/exists` | 路径前缀存在性校验（path_filter 辅助） |
 | POST | `/api/v1/repos/{id}/refresh` | 增量刷新（同仓分布式锁互斥） |
 | GET | `/api/v1/events` | SSE 事件推送（`Last-Event-ID` 断线回放） |
 | GET | `/api/v1/ws` | WebSocket 推送（`resume_from` 回放） |
