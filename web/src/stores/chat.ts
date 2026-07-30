@@ -252,7 +252,8 @@ export async function ask(
   onUpdate?.()
 
   const pacer = typewriterPacer(ai, onUpdate)
-  const body: Record<string, unknown> = { repo_id: repoId, question: q, mode, top_k: 8, history }
+  // top_k 不传：由后端使用配置中心 retriever.top_k（设置页可调），前端不硬编码覆盖。
+  const body: Record<string, unknown> = { repo_id: repoId, question: q, mode, history }
   if (pathFilter.trim()) body.path_filter = pathFilter.trim()
 
   const { abort, done } = streamSSE(
