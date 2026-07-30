@@ -461,11 +461,13 @@ func buildRetrievers(searchCli *search.Client, chunks store.ChunkStore, vectors 
 	kw := retriever.NewKeywordRetriever(searchCli, chunks, logger)
 	vec := retriever.NewVectorRetriever(pool, emb, cfg.Storage.Vector.EFSearch, logger)
 	hyb := retriever.NewHybridRetriever(kw, vec, cfg.Retriever.RRFK, logger)
+	// hybrid 外再包 Multi-Query（改写 3 路并行召回合并）与 rerank（合并后重排一次）。
+	mq := retriever.NewMultiQueryRetriever(hyb, llmClient, logger)
 	reranker := retriever.NewLLMReranker(llmClient)
 	return map[string]retriever.Retriever{
 		"keyword":   retriever.NewRerankRetriever(kw, logger).WithReranker(reranker),
 		"embedding": retriever.NewRerankRetriever(vec, logger).WithReranker(reranker),
-		"hybrid":    retriever.NewRerankRetriever(hyb, logger).WithReranker(reranker),
+		"hybrid":    retriever.NewRerankRetriever(mq, logger).WithReranker(reranker),
 	}
 }
 
