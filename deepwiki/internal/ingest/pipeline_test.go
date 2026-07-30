@@ -159,8 +159,13 @@ func TestPipelineRunStages(t *testing.T) {
 		t.Fatalf("persisted %d chunks, pc has %d", len(persister.chunks), len(pc.Chunks))
 	}
 	for _, c := range persister.chunks {
-		if len(c.Vector) != 3 || c.EmbeddingModel != "fake-embed-v1" {
-			t.Fatalf("chunk %s missing vector/model: %+v", c.ChunkID, c)
+		if c.ParentChunkID == "" {
+			// 父块：不向量化（完整上下文，仅 PG）。
+			if len(c.Vector) != 0 {
+				t.Fatalf("parent chunk %s should have no vector: %+v", c.ChunkID, c)
+			}
+		} else if len(c.Vector) != 3 || c.EmbeddingModel != "fake-embed-v1" {
+			t.Fatalf("child chunk %s missing vector/model: %+v", c.ChunkID, c)
 		}
 		if c.StartLine < 1 || c.StartLine > c.EndLine || c.Path == "" {
 			t.Fatalf("chunk %s invalid span/path: %+v", c.ChunkID, c)

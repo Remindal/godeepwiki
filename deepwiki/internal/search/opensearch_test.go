@@ -41,10 +41,11 @@ func testClient(t *testing.T) *Client {
 }
 
 func testChunks(repoID string) []model.Chunk {
+	// 父子块双层索引：OpenSearch 只索引子块（ParentChunkID 非空）。
 	return []model.Chunk{
-		{ChunkID: "chk_01J2X9K7QZ0ABCDEFGHJKMN1", RepoID: repoID, Path: "router/group.go", Content: "router group handles HTTP routing tree", Language: "go", StartLine: 1, EndLine: 10},
-		{ChunkID: "chk_01J2X9K7QZ0ABCDEFGHJKMN2", RepoID: repoID, Path: "router/engine.go", Content: "engine dispatches requests to the router", Language: "go", StartLine: 1, EndLine: 20},
-		{ChunkID: "chk_01J2X9K7QZ0ABCDEFGHJKMN3", RepoID: repoID, Path: "docs/guide.md", Content: "# Guide\nunrelated markdown documentation about deploy", Language: "markdown", StartLine: 1, EndLine: 5},
+		{ChunkID: "chk_01J2X9K7QZ0ABCDEFGHJKMN1", RepoID: repoID, Path: "router/group.go", Content: "router group handles HTTP routing tree", Language: "go", StartLine: 1, EndLine: 10, ParentChunkID: "chk_parent_1"},
+		{ChunkID: "chk_01J2X9K7QZ0ABCDEFGHJKMN2", RepoID: repoID, Path: "router/engine.go", Content: "engine dispatches requests to the router", Language: "go", StartLine: 1, EndLine: 20, ParentChunkID: "chk_parent_2"},
+		{ChunkID: "chk_01J2X9K7QZ0ABCDEFGHJKMN3", RepoID: repoID, Path: "docs/guide.md", Content: "# Guide\nunrelated markdown documentation about deploy", Language: "markdown", StartLine: 1, EndLine: 5, ParentChunkID: "chk_parent_3"},
 	}
 }
 

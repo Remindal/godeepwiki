@@ -282,20 +282,28 @@ func (e *RefreshExecutor) Execute(ctx context.Context, t *model.Task) error {
 			return nil
 		}},
 		{Name: model.TaskStateEmbedding, Fn: func(ctx context.Context, pc *ingest.PipelineContext) error {
-			if len(pc.Chunks) == 0 {
-				return nil
-			}
-			texts := make([]string, len(pc.Chunks))
+			// 父子块双层索引：只给子块打向量（同 ingest 阶段）。
+			var childIdx []int
+			var texts []string
 			for i, c := range pc.Chunks {
-				texts[i] = c.Content
+				if c.ParentChunkID != "" {
+					childIdx = append(childIdx, i)
+					texts = append(texts, c.Content)
+				}
+			}
+			if len(texts) == 0 {
+				return nil
 			}
 			vectors, err := e.embedder.Embed(ctx, texts)
 			if err != nil {
 				return err
 			}
+			if len(vectors) != len(texts) {
+				return fmt.Errorf("embedder returned %d vectors for %d chunks", len(vectors), len(texts))
+			}
 			modelName := e.embedder.ModelName()
-			for i := range pc.Chunks {
-				pc.Chunks[i].Vector = vectors[i]
+			for j, i := range childIdx {
+				pc.Chunks[i].Vector = vectors[j]
 				pc.Chunks[i].EmbeddingModel = modelName
 			}
 			return nil

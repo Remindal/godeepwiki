@@ -77,13 +77,17 @@ func (r *VectorRetriever) SearchByVector(ctx context.Context, repoID string, vec
 	if pathFilter != "" {
 		pathPattern = pathFilter + "%"
 	}
+	// 父子块双层检索：子块（带向量）做相似度，JOIN 父块返回完整上下文。
 	rows, err := tx.Query(ctx, `
-		SELECT chunk_id, path, start_line, end_line, language, content,
-		       1 - (embedding <=> $2) AS score
-		FROM chunks
-		WHERE repo_id = $1
-		  AND ($3::text IS NULL OR path LIKE $3)
-		ORDER BY embedding <=> $2
+		SELECT p.chunk_id, p.path, p.start_line, p.end_line, p.language, p.content,
+		       1 - (c.embedding <=> $2) AS score
+		FROM chunks c
+		JOIN chunks p ON c.parent_chunk_id = p.chunk_id
+		WHERE c.repo_id = $1
+		  AND c.parent_chunk_id IS NOT NULL
+		  AND c.embedding IS NOT NULL
+		  AND ($3::text IS NULL OR p.path LIKE $3)
+		ORDER BY c.embedding <=> $2
 		LIMIT $4
 	`, repoID, pgvector.NewVector(vector), pathPattern, topK)
 	if err != nil {
@@ -92,11 +96,16 @@ func (r *VectorRetriever) SearchByVector(ctx context.Context, repoID string, vec
 	defer rows.Close()
 
 	var hits []model.ChunkHit
+	seen := map[string]bool{} // 按父块去重：同一父块的多个子块命中只留第一个（score 最优）
 	for rows.Next() {
 		var h model.ChunkHit
 		if err := rows.Scan(&h.Chunk.ChunkID, &h.Chunk.Path, &h.Chunk.StartLine, &h.Chunk.EndLine, &h.Chunk.Language, &h.Chunk.Content, &h.Score); err != nil {
 			return nil, fmt.Errorf("%w: %v", model.ErrVectorStoreUnavailable, err)
 		}
+		if seen[h.Chunk.ChunkID] {
+			continue
+		}
+		seen[h.Chunk.ChunkID] = true
 		h.Chunk.RepoID = repoID
 		hits = append(hits, h)
 	}

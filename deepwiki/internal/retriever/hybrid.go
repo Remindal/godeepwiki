@@ -94,10 +94,12 @@ func rrfFuse(k, topK int, lists ...[]model.ChunkHit) []model.ChunkHit {
 	byID := make(map[string]*merged)
 	for _, hits := range lists {
 		for rank, h := range hits {
-			m, ok := byID[h.Chunk.ChunkID]
+			// 父子块双层索引：按上下文归属块（父块）去重融合。
+			key := h.Chunk.ContextID()
+			m, ok := byID[key]
 			if !ok {
 				m = &merged{hit: h}
-				byID[h.Chunk.ChunkID] = m
+				byID[key] = m
 			}
 			m.score += 1.0 / float64(k+rank+1)
 		}

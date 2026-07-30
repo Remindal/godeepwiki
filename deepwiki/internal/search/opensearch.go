@@ -156,6 +156,9 @@ func (c *Client) BulkIndex(ctx context.Context, repoID string, chunks []model.Ch
 		}
 		var buf bytes.Buffer
 		for _, ch := range chunks[start:end] {
+			if ch.ParentChunkID == "" {
+				continue // 父子块双层索引：OpenSearch 只索引子块（父块仅供上下文，不进 BM25）
+			}
 			meta, err := json.Marshal(map[string]any{"index": map[string]any{"_index": index, "_id": ch.ChunkID}})
 			if err != nil {
 				return err
@@ -176,6 +179,9 @@ func (c *Client) BulkIndex(ctx context.Context, repoID string, chunks []model.Ch
 			buf.WriteByte('\n')
 			buf.Write(doc)
 			buf.WriteByte('\n')
+		}
+		if buf.Len() == 0 {
+			continue // 本批全是父块（不入 BM25）：跳过空 bulk（OpenSearch 对空 body 报 400）
 		}
 		resp, err := c.api.Bulk(ctx, opensearchapi.BulkReq{Body: &buf})
 		if err != nil {

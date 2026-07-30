@@ -27,6 +27,15 @@ func itChunkIDs() []string {
 	}
 }
 
+// itParentIDs 父块 ID（合法 26 位 ULID 后缀，与 itChunkIDs 一一对应）。
+func itParentIDs() []string {
+	return []string{
+		"chk_01J2X9K7QZ0ABCDEFGHJKMNQPA",
+		"chk_01J2X9K7QZ0ABCDEFGHJKMNQPB",
+		"chk_01J2X9K7QZ0ABCDEFGHJKMNQPC",
+	}
+}
+
 // itSetup 准备真实 Postgres（chunks 表）与 OpenSearch（索引）测试数据；任一不可达则 Skip。
 func itSetup(t *testing.T) (context.Context, *pgxpool.Pool, *search.Client, store.ChunkStore) {
 	t.Helper()
@@ -73,6 +82,7 @@ func itSetup(t *testing.T) (context.Context, *pgxpool.Pool, *search.Client, stor
 	})
 
 	ids := itChunkIDs()
+	parentIDs := itParentIDs()
 	rows := []struct {
 		path, content, lang string
 		vec                 []float32
@@ -82,10 +92,18 @@ func itSetup(t *testing.T) (context.Context, *pgxpool.Pool, *search.Client, stor
 		{"docs/deploy.md", "deployment guide for production clusters", "markdown", itVector(1024, 2, 1.0)},
 	}
 	for i, r := range rows {
+		// 父子块结构：父块（无向量，完整上下文）+ 子块（带向量，parent_chunk_id 指回父块）。
+		parentID := parentIDs[i]
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO chunks (chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding)
-			VALUES ($1, $2, $3, 1, 10, $4, $5, 'hash', 'it-model', $6)
-		`, ids[i], itRepoID, r.path, r.lang, r.content, pgvector.NewVector(r.vec)); err != nil {
+			VALUES ($1, $2, $3, 1, 10, $4, $5, 'hash', 'it-model', NULL)
+		`, parentID, itRepoID, r.path, r.lang, r.content); err != nil {
+			t.Fatalf("insert parent chunk %s: %v", parentID, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chunks (chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding, parent_chunk_id)
+			VALUES ($1, $2, $3, 1, 10, $4, $5, 'hash', 'it-model', $6, $7)
+		`, ids[i], itRepoID, r.path, r.lang, r.content, pgvector.NewVector(r.vec), parentID); err != nil {
 			t.Fatalf("insert chunk %s: %v", ids[i], err)
 		}
 	}
@@ -94,9 +112,9 @@ func itSetup(t *testing.T) (context.Context, *pgxpool.Pool, *search.Client, stor
 		t.Fatalf("CreateIndex: %v", err)
 	}
 	docs := []model.Chunk{
-		{ChunkID: ids[0], RepoID: itRepoID, Path: rows[0].path, Content: rows[0].content, Language: rows[0].lang, StartLine: 1, EndLine: 10},
-		{ChunkID: ids[1], RepoID: itRepoID, Path: rows[1].path, Content: rows[1].content, Language: rows[1].lang, StartLine: 1, EndLine: 10},
-		{ChunkID: ids[2], RepoID: itRepoID, Path: rows[2].path, Content: rows[2].content, Language: rows[2].lang, StartLine: 1, EndLine: 10},
+		{ChunkID: ids[0], RepoID: itRepoID, Path: rows[0].path, Content: rows[0].content, Language: rows[0].lang, StartLine: 1, EndLine: 10, ParentChunkID: parentIDs[0]},
+		{ChunkID: ids[1], RepoID: itRepoID, Path: rows[1].path, Content: rows[1].content, Language: rows[1].lang, StartLine: 1, EndLine: 10, ParentChunkID: parentIDs[1]},
+		{ChunkID: ids[2], RepoID: itRepoID, Path: rows[2].path, Content: rows[2].content, Language: rows[2].lang, StartLine: 1, EndLine: 10, ParentChunkID: parentIDs[2]},
 	}
 	if err := osCli.BulkIndex(ctx, itRepoID, docs); err != nil {
 		t.Fatalf("BulkIndex: %v", err)
@@ -181,9 +199,9 @@ func TestVectorRetrieverIntegration(t *testing.T) {
 	if len(hits) != 3 {
 		t.Fatalf("got %d hits, want 3", len(hits))
 	}
-	ids := itChunkIDs()
-	if hits[0].Chunk.ChunkID != ids[0] {
-		t.Fatalf("nearest = %s, want %s (one-hot [1,0,...])", hits[0].Chunk.ChunkID, ids[0])
+	parentIDs := itParentIDs()
+	if hits[0].Chunk.ChunkID != parentIDs[0] {
+		t.Fatalf("nearest = %s, want parent %s (one-hot [1,0,...])", hits[0].Chunk.ChunkID, parentIDs[0])
 	}
 	for i := 1; i < len(hits); i++ {
 		if hits[i-1].Score < hits[i].Score {

@@ -12,8 +12,9 @@ func TestChunkFilesSmallFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChunkFiles: %v", err)
 	}
-	if len(chunks) != 1 {
-		t.Fatalf("got %d chunks, want 1", len(chunks))
+	// 父子块双层索引：小文件 → 1 父块 + 1 子块。
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2 (1 parent + 1 child)", len(chunks))
 	}
 	c := chunks[0]
 	if c.StartLine != 1 || c.EndLine != 3 {
@@ -27,6 +28,16 @@ func TestChunkFilesSmallFile(t *testing.T) {
 	}
 	if c.RepoID != "repo_1" || c.Path != "a.go" || c.Language != "go" || c.FileHash != "h1" {
 		t.Fatalf("unexpected chunk fields: %+v", c)
+	}
+	if c.ParentChunkID != "" {
+		t.Fatalf("parent chunk should have empty ParentChunkID, got %q", c.ParentChunkID)
+	}
+	child := chunks[1]
+	if child.ParentChunkID != c.ChunkID {
+		t.Fatalf("child ParentChunkID = %q, want parent %q", child.ParentChunkID, c.ChunkID)
+	}
+	if child.StartLine != 1 || child.EndLine != 3 || child.Content != c.Content {
+		t.Fatalf("unexpected child span/content: %+v", child)
 	}
 }
 
@@ -66,17 +77,21 @@ func TestChunkFilesMarkdownHeadings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChunkFiles: %v", err)
 	}
-	if len(chunks) != 2 {
-		t.Fatalf("got %d chunks, want 2 (heading split)", len(chunks))
+	// 标题强制切 2 个父块，各带 1 个子块 → 共 4 块。
+	if len(chunks) != 4 {
+		t.Fatalf("got %d chunks, want 4 (2 parents + 2 children)", len(chunks))
 	}
 	if chunks[0].StartLine != 1 || chunks[0].EndLine != 3 {
-		t.Fatalf("chunk0 span = %d-%d, want 1-3", chunks[0].StartLine, chunks[0].EndLine)
+		t.Fatalf("parent0 span = %d-%d, want 1-3", chunks[0].StartLine, chunks[0].EndLine)
 	}
-	if chunks[1].StartLine != 4 || chunks[1].EndLine != 6 {
-		t.Fatalf("chunk1 span = %d-%d, want 4-6", chunks[1].StartLine, chunks[1].EndLine)
+	if chunks[2].StartLine != 4 || chunks[2].EndLine != 6 {
+		t.Fatalf("parent1 span = %d-%d, want 4-6", chunks[2].StartLine, chunks[2].EndLine)
 	}
-	if !strings.HasPrefix(chunks[1].Content, "# Usage") {
-		t.Fatalf("chunk1 content = %q", chunks[1].Content)
+	if !strings.HasPrefix(chunks[2].Content, "# Usage") {
+		t.Fatalf("parent1 content = %q", chunks[2].Content)
+	}
+	if chunks[1].ParentChunkID != chunks[0].ChunkID || chunks[3].ParentChunkID != chunks[2].ChunkID {
+		t.Fatalf("children not linked to parents: %+v", chunks)
 	}
 }
 

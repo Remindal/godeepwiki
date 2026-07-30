@@ -17,9 +17,10 @@ func EstimateTokens(s string) int {
 	return (runes + 3) / 4
 }
 
-// ChunkFiles 把 SourceFile 切分为 Chunk（基线 §12.4 切分策略）：
-// 行对齐固定窗口，按行累加 token 至 chunk_size 切块，块间回退 chunk_overlap 对应行数重叠；
-// Markdown 遇标题行（#~######）强制切块，块内仍按窗口兜底；一块一文件，不跨文件合并。
+// ChunkFiles 把 SourceFile 切分为两层 Chunk（父子块双层索引）：
+// 父块 = 现有行对齐固定窗口（chunk_size，完整上下文单元，不嵌向量，仅供 LLM 上下文）；
+// 子块 = 父块内再切 ~300 token 小窗（40 token 重叠，嵌向量用于检索，parent_chunk_id 指回父块）。
+// 产出顺序：每个父块后紧跟其子块（持久化与索引按 ParentChunkID 区分）。
 func ChunkFiles(ctx context.Context, repoID string, files []SourceFile, opts IngestOptions) ([]model.Chunk, error) {
 	chunkSize := opts.ChunkSize
 	if chunkSize <= 0 {
@@ -49,7 +50,7 @@ func ChunkFiles(ctx context.Context, repoID string, files []SourceFile, opts Ing
 			boundary = isMarkdownHeading
 		}
 		for _, span := range splitWindows(lines, chunkSize, chunkOverlap, boundary) {
-			chunks = append(chunks, model.Chunk{
+			parent := model.Chunk{
 				ChunkID:   newChunkID(),
 				RepoID:    repoID,
 				Path:      f.Path,
@@ -58,11 +59,34 @@ func ChunkFiles(ctx context.Context, repoID string, files []SourceFile, opts Ing
 				Language:  f.Language,
 				Content:   strings.Join(lines[span[0]:span[1]], "\n"),
 				FileHash:  f.Hash,
-			})
+			}
+			chunks = append(chunks, parent)
+			// 子块：父块内 ~300 token 小窗（40 重叠），用于向量检索，上下文回查父块。
+			parentLines := lines[span[0]:span[1]]
+			for _, cspan := range splitWindows(parentLines, childWindowTokens, childOverlapTokens, nil) {
+				chunks = append(chunks, model.Chunk{
+					ChunkID:       newChunkID(),
+					RepoID:        repoID,
+					Path:          f.Path,
+					StartLine:     parent.StartLine + cspan[0],
+					EndLine:       parent.StartLine + cspan[1] - 1,
+					Language:      f.Language,
+					Content:       strings.Join(parentLines[cspan[0]:cspan[1]], "\n"),
+					FileHash:      f.Hash,
+					ParentChunkID: parent.ChunkID,
+				})
+			}
 		}
 	}
 	return chunks, nil
 }
+
+const (
+	// childWindowTokens 子块窗口（~300 token，检索粒度）。
+	childWindowTokens = 300
+	// childOverlapTokens 子块重叠（保持句意连续）。
+	childOverlapTokens = 40
+)
 
 // splitWindows 行窗口切分，返回 [start, end) 行区间序列。
 // boundary(line) 为 true 时该行强制成为新块首行（Markdown 标题）；重叠回退不越过强制边界。

@@ -42,7 +42,7 @@ const chunkBatchSize = 500
 
 var chunkColumns = []string{
 	"chunk_id", "repo_id", "path", "start_line", "end_line",
-	"language", "content", "file_hash", "embedding_model", "embedding",
+	"language", "content", "file_hash", "embedding_model", "embedding", "parent_chunk_id",
 }
 
 func (s *pgChunkStore) InsertBatch(ctx context.Context, chunks []model.Chunk) error {
@@ -72,9 +72,9 @@ func (s *pgChunkStore) InsertBatch(ctx context.Context, chunks []model.Chunk) er
 	return nil
 }
 
-// buildChunkInsert 构造 INSERT INTO chunks (...) VALUES (...),(...),... 与参数（每行 10 个 $n）。
+// buildChunkInsert 构造 INSERT INTO chunks (...) VALUES (...),(...),... 与参数（每行 11 个 $n）。
 func buildChunkInsert(chunks []model.Chunk) (string, []interface{}) {
-	const cols = 10
+	const cols = 11
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO chunks (")
 	sb.WriteString(strings.Join(chunkColumns, ", "))
@@ -97,9 +97,13 @@ func buildChunkInsert(chunks []model.Chunk) (string, []interface{}) {
 		if len(c.Vector) > 0 {
 			emb = pgvector.NewVector(c.Vector)
 		}
+		var parentID interface{}
+		if c.ParentChunkID != "" {
+			parentID = c.ParentChunkID
+		}
 		args = append(args,
 			c.ChunkID, c.RepoID, c.Path, c.StartLine, c.EndLine,
-			c.Language, c.Content, c.FileHash, c.EmbeddingModel, emb,
+			c.Language, c.Content, c.FileHash, c.EmbeddingModel, emb, parentID,
 		)
 	}
 	return sb.String(), args
@@ -110,17 +114,21 @@ func (s *pgChunkStore) GetByID(ctx context.Context, chunkID string) (*model.Chun
 		return nil, err
 	}
 	row := s.pool.QueryRow(ctx, `
-		SELECT chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding
+		SELECT chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding, parent_chunk_id
 		FROM chunks WHERE chunk_id = $1
 	`, chunkID)
 	var c model.Chunk
 	var vec *pgvector.Vector
-	err := row.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content, &c.FileHash, &c.EmbeddingModel, &vec)
+	var parentID *string
+	err := row.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content, &c.FileHash, &c.EmbeddingModel, &vec, &parentID)
 	if err != nil {
 		return nil, err
 	}
 	if vec != nil {
 		c.Vector = vec.Slice()
+	}
+	if parentID != nil {
+		c.ParentChunkID = *parentID
 	}
 	return &c, nil
 }
@@ -132,7 +140,7 @@ func (s *pgChunkStore) GetByIDs(ctx context.Context, chunkIDs []string) ([]*mode
 		}
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding
+		SELECT chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding, parent_chunk_id
 		FROM chunks WHERE chunk_id = ANY($1)
 	`, chunkIDs)
 	if err != nil {
@@ -143,11 +151,15 @@ func (s *pgChunkStore) GetByIDs(ctx context.Context, chunkIDs []string) ([]*mode
 	for rows.Next() {
 		var c model.Chunk
 		var vec *pgvector.Vector
-		if err := rows.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content, &c.FileHash, &c.EmbeddingModel, &vec); err != nil {
+		var parentID *string
+		if err := rows.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content, &c.FileHash, &c.EmbeddingModel, &vec, &parentID); err != nil {
 			return nil, err
 		}
 		if vec != nil {
 			c.Vector = vec.Slice()
+		}
+		if parentID != nil {
+			c.ParentChunkID = *parentID
 		}
 		out = append(out, &c)
 	}

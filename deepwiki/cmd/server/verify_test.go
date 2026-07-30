@@ -44,6 +44,11 @@ func TestVerifyIndicesRebuild(t *testing.T) {
 	}
 
 	repoID := "repo_01J2X9K7QZ0ABCDEFGHJKMNQR9"
+	parentIDs := []string{
+		"chk_01J2X9K7QZ0ABCDEFGHJKMNQP9",
+		"chk_01J2X9K7QZ0ABCDEFGHJKMNQPA",
+		"chk_01J2X9K7QZ0ABCDEFGHJKMNQPB",
+	}
 	chunkIDs := []string{
 		"chk_01J2X9K7QZ0ABCDEFGHJKMNQR9",
 		"chk_01J2X9K7QZ0ABCDEFGHJKMNQRA",
@@ -62,16 +67,25 @@ func TestVerifyIndicesRebuild(t *testing.T) {
 	}()
 	vec := make([]float32, 1024)
 	vec[0] = 1.0
-	for i, id := range chunkIDs {
+	// 父子块结构：父块无向量不进索引，子块带向量（OpenSearch 装块口径 = 子块数）。
+	for i, id := range parentIDs {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO chunks (chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding)
-			VALUES ($1, $2, $3, 1, 5, 'go', $4, 'hash', 'it-model', $5)
-		`, id, repoID, "a.go", "package a", pgvector.NewVector(vec)); err != nil {
+			VALUES ($1, $2, $3, 1, 5, 'go', $4, 'hash', 'it-model', NULL)
+		`, id, repoID, "a.go", "package a"); err != nil {
+			t.Fatalf("insert parent chunk %d: %v", i, err)
+		}
+	}
+	for i, id := range chunkIDs {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chunks (chunk_id, repo_id, path, start_line, end_line, language, content, file_hash, embedding_model, embedding, parent_chunk_id)
+			VALUES ($1, $2, $3, 1, 5, 'go', $4, 'hash', 'it-model', $5, $6)
+		`, id, repoID, "a.go", "package a", pgvector.NewVector(vec), parentIDs[i]); err != nil {
 			t.Fatalf("insert chunk %d: %v", i, err)
 		}
 	}
 
-	// 建立空索引制造不一致（postgres=3，opensearch=0）
+	// 建立空索引制造不一致（postgres=3 子块，opensearch=0）
 	if err := osCli.CreateIndex(ctx, repoID); err != nil {
 		t.Fatalf("CreateIndex: %v", err)
 	}

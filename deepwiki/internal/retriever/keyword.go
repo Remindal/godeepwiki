@@ -57,23 +57,56 @@ func (r *KeywordRetriever) SearchWithPath(ctx context.Context, repoID string, qu
 	for i, h := range hits {
 		ids[i] = h.ChunkID
 	}
-	chunks, err := r.chunkStore.GetByIDs(ctx, ids)
+	children, err := r.chunkStore.GetByIDs(ctx, ids)
 	if err != nil {
 		return nil, fmt.Errorf("backfill chunks: %w", err)
 	}
-	byID := make(map[string]*model.Chunk, len(chunks))
-	for _, c := range chunks {
-		byID[c.ChunkID] = c
+	childByID := make(map[string]*model.Chunk, len(children))
+	for _, c := range children {
+		childByID[c.ChunkID] = c
+	}
+
+	// 父子块双层索引：命中子块 → 回查父块返回完整上下文；按父块去重保留最优子块分。
+	var parentIDs []string
+	seenParent := map[string]bool{}
+	for _, h := range hits {
+		c, ok := childByID[h.ChunkID]
+		if !ok || c.ParentChunkID == "" || seenParent[c.ParentChunkID] {
+			continue
+		}
+		seenParent[c.ParentChunkID] = true
+		parentIDs = append(parentIDs, c.ParentChunkID)
+	}
+	parents, err := r.chunkStore.GetByIDs(ctx, parentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("backfill parent chunks: %w", err)
+	}
+	parentByID := make(map[string]*model.Chunk, len(parents))
+	for _, p := range parents {
+		parentByID[p.ChunkID] = p
 	}
 
 	out := make([]model.ChunkHit, 0, len(hits))
+	emitted := map[string]bool{}
 	for _, h := range hits {
-		c, ok := byID[h.ChunkID]
+		c, ok := childByID[h.ChunkID]
 		if !ok {
 			r.logger.Warn("opensearch hit missing in postgres, skip", zap.String("chunk_id", h.ChunkID), zap.String("repo_id", repoID))
 			continue
 		}
-		out = append(out, model.ChunkHit{Chunk: *c, Score: h.Score})
+		if c.ParentChunkID == "" {
+			continue // 父块不进 BM25，理论不出现
+		}
+		if emitted[c.ParentChunkID] {
+			continue
+		}
+		p, ok := parentByID[c.ParentChunkID]
+		if !ok {
+			r.logger.Warn("parent chunk missing in postgres, skip", zap.String("parent_chunk_id", c.ParentChunkID))
+			continue
+		}
+		emitted[c.ParentChunkID] = true
+		out = append(out, model.ChunkHit{Chunk: *p, Score: h.Score})
 	}
 	return out, nil
 }

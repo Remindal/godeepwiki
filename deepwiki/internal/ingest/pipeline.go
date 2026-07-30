@@ -114,23 +114,28 @@ func NewIngestStages(deps StageDeps) []Stage {
 			return nil
 		}},
 		{Name: model.TaskStateEmbedding, Fn: func(ctx context.Context, pc *PipelineContext) error {
-			if len(pc.Chunks) == 0 {
-				return nil
-			}
-			texts := make([]string, len(pc.Chunks))
+			// 父子块双层索引：只给子块（ParentChunkID 非空）打向量；父块不嵌向量（仅供上下文）。
+			var childIdx []int
+			var texts []string
 			for i, c := range pc.Chunks {
-				texts[i] = c.Content
+				if c.ParentChunkID != "" {
+					childIdx = append(childIdx, i)
+					texts = append(texts, c.Content)
+				}
+			}
+			if len(texts) == 0 {
+				return nil
 			}
 			vectors, err := deps.Embedder.Embed(ctx, texts)
 			if err != nil {
 				return err
 			}
-			if len(vectors) != len(pc.Chunks) {
-				return fmt.Errorf("embedder returned %d vectors for %d chunks", len(vectors), len(pc.Chunks))
+			if len(vectors) != len(texts) {
+				return fmt.Errorf("embedder returned %d vectors for %d chunks", len(vectors), len(texts))
 			}
 			modelName := deps.Embedder.ModelName()
-			for i := range pc.Chunks {
-				pc.Chunks[i].Vector = vectors[i]
+			for j, i := range childIdx {
+				pc.Chunks[i].Vector = vectors[j]
 				pc.Chunks[i].EmbeddingModel = modelName
 			}
 			return nil

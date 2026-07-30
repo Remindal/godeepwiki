@@ -23,7 +23,6 @@ profile.out
 # 环境变量与密钥（硬约束 #2）
 .env
 .env.local
-
 # 日志
 *.log
 /logs/

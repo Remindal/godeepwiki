@@ -471,7 +471,8 @@ func buildRetrievers(searchCli *search.Client, chunks store.ChunkStore, vectors 
 	}
 }
 
-// verifyIndices 启动一致性校验（总纲 §4.2）：每仓 count(index) == chunks 表行数，
+// verifyIndices 启动一致性校验（总纲 §4.2）：每仓 count(index) == chunks 子块行数
+//（父子块双层索引后 OpenSearch 只装子块；父块仅供上下文不参与对账），
 // 不一致 → WARN 并后台重建该仓索引（本函数在独立 goroutine 中运行，重建随校验内联完成）。
 func verifyIndices(ctx context.Context, repos store.RepoStore, chunks store.ChunkStore, searchCli *search.Client, pool *pgxpool.Pool, logger *zap.Logger) {
 	defer func() { // 校验失败不得拖垮启动（硬约束 #4）
@@ -485,8 +486,9 @@ func verifyIndices(ctx context.Context, repos store.RepoStore, chunks store.Chun
 		return
 	}
 	for _, repoID := range repoIDs {
-		want, err := chunks.CountByRepo(ctx, repoID)
-		if err != nil {
+		// 对账口径 = 子块行数（parent_chunk_id IS NOT NULL），与 OpenSearch 装块口径一致。
+		var want int64
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM chunks WHERE repo_id = $1 AND parent_chunk_id IS NOT NULL`, repoID).Scan(&want); err != nil {
 			logger.Error("verify indices: count chunks failed", zap.String("repo_id", repoID), zap.Error(err))
 			continue
 		}
@@ -508,11 +510,11 @@ func verifyIndices(ctx context.Context, repos store.RepoStore, chunks store.Chun
 	logger.Info("opensearch indices verified", zap.Int("repos", len(repoIDs)))
 }
 
-// rebuildIndex 全量重建单仓索引：删索引 → 建索引 → 从 chunks 表读全量 → bulk 重写（幂等 _id=chunk_id）。
+// rebuildIndex 全量重建单仓索引：删索引 → 建索引 → 从 chunks 表读子块（parent_chunk_id IS NOT NULL）→ bulk 重写（幂等 _id=chunk_id）。
 func rebuildIndex(ctx context.Context, pool *pgxpool.Pool, searchCli *search.Client, repoID string) error {
 	rows, err := pool.Query(ctx, `
-		SELECT chunk_id, repo_id, path, start_line, end_line, language, content
-		FROM chunks WHERE repo_id = $1
+		SELECT chunk_id, repo_id, path, start_line, end_line, language, content, parent_chunk_id
+		FROM chunks WHERE repo_id = $1 AND parent_chunk_id IS NOT NULL
 	`, repoID)
 	if err != nil {
 		return err
@@ -521,8 +523,12 @@ func rebuildIndex(ctx context.Context, pool *pgxpool.Pool, searchCli *search.Cli
 	var chunks []model.Chunk
 	for rows.Next() {
 		var c model.Chunk
-		if err := rows.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content); err != nil {
+		var parentID *string
+		if err := rows.Scan(&c.ChunkID, &c.RepoID, &c.Path, &c.StartLine, &c.EndLine, &c.Language, &c.Content, &parentID); err != nil {
 			return err
+		}
+		if parentID != nil {
+			c.ParentChunkID = *parentID
 		}
 		chunks = append(chunks, c)
 	}
