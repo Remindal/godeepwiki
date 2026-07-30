@@ -2,8 +2,8 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-logo">DW</div>
-        <span class="brand-name">DeepWiki</span>
+        <div class="brand-logo">GW</div>
+        <span class="brand-name">GoWiki</span>
       </div>
 
       <button class="new-chat-btn" @click="$router.push({ path: '/', query: { ingest: '1' } })">

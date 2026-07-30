@@ -11,7 +11,7 @@
     <div class="chat-area" ref="scrollEl">
       <div class="chat-inner">
         <div v-if="!messages.length" class="chat-empty">
-          <div class="empty-logo">DW</div>
+          <div class="empty-logo">GW</div>
           <p class="dw-muted">向这个仓库提问，回答都会附上代码出处</p>
           <div class="hints">
             <div v-for="h in hints" :key="h" class="hint dw-card" @click="submit(h)">{{ h }}</div>
@@ -26,7 +26,7 @@
 
           <!-- AI 气泡 -->
           <div v-else class="msg-row">
-            <div class="ai-avatar">DW</div>
+            <div class="ai-avatar">GW</div>
             <div class="ai-body">
               <div v-if="m.thinking" class="thinking-wrap">
                 <div class="thinking-title dw-faint" @click="m.thinkingOpen = !m.thinkingOpen">

@@ -1,4 +1,4 @@
-# DeepWiki(Go版)
+# GoWiki
 
 Git 仓库智能问答系统：仓库异步摄取（git CLI 克隆→解析→切分→向量化→落库）→ 语义检索问答
 （keyword=OpenSearch BM25 / embedding=pgvector HNSW / hybrid RRF 可插拔检索 + 多 LLM Provider 官方 SDK，
