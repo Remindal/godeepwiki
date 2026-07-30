@@ -133,6 +133,12 @@ const scrollEl = ref<HTMLElement>()
 // repoId 跟随路由参数响应式变化；convId 跟随 query.c（默认 default）。
 const repoId = computed(() => route.params.repoId as string)
 const convId = computed(() => (route.query.c as string) || 'default')
+
+// 同组件内切换仓库（路由 params 变化不重建组件）时，重新加载该仓库持久化的 path_filter，
+// 否则上个仓库的过滤条件会残留并带到新仓库的提问里。
+watch(repoId, (id) => {
+  pathFilter.value = localStorage.getItem(`dw_pathfilter_${id}`) || ''
+})
 const chat = computed(() => getChat(repoId.value, convId.value))
 const messages = computed(() => chat.value.messages)
 const streaming = computed(() => chat.value.streaming)

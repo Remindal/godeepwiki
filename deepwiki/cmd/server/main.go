@@ -322,9 +322,10 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 	}()
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	// provider（LLM/Embedding）经代理访问外网，冷启动首次 TLS 握手较慢，给更宽的超时；
-	// 仅作用于后台探测 goroutine，不会阻塞 health 请求路径。
-	providerCtx, providerCancel := context.WithTimeout(ctx, 20*time.Second)
+	// provider（LLM/Embedding）经代理访问外网，冷启动首次 TLS 握手较慢；
+	// 且 thinking 模型（DeepSeek-V4 等）连 ping 也会先跑推理，20s 经常性超时误报。
+	// 给 60s 宽限；仅作用于后台探测 goroutine，不会阻塞 health 请求路径。
+	providerCtx, providerCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer providerCancel()
 
 	degraded := false
