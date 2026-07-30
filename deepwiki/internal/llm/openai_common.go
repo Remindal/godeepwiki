@@ -139,10 +139,11 @@ func streamWithOpenAI(
 				sc.Delta = d.Content
 				if sc.Delta == "" {
 					// DeepSeek-V4 等 thinking 模型的推理阶段经 delta.reasoning_content 下发
-					//（openai-go 未建模该扩展字段，落 ExtraFields）。标记 Reasoning 供前端折叠灰显。
-					if f, ok := d.JSON.ExtraFields["reasoning_content"]; ok && f.Valid() {
+					//（openai-go 未建模该扩展字段，落 ExtraFields；其 Valid() 恒 false，
+					// 不能作为存在性判断）。标记 Reasoning 供前端折叠灰显。
+					if f, ok := d.JSON.ExtraFields["reasoning_content"]; ok {
 						var rs string
-						if json.Unmarshal([]byte(f.Raw()), &rs) == nil {
+						if json.Unmarshal([]byte(f.Raw()), &rs) == nil && rs != "" {
 							sc.Delta = rs
 							sc.Reasoning = true
 						}
