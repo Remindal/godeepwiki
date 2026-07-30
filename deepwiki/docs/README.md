@@ -1,9 +1,6 @@
-# GoWiki API 文档（占位）
+# GoWiki 文档
 
-API 契约以系统设计基线 §5、§6 与《01_API_正式版》为唯一权威：
-- 端点总表：§5.1（18 个端点，/api/v1 前缀，/metrics 除外）
-- 统一信封与错误码：§5.2、§5.3（v2 新增 50302/50303/50304/50203 四个基础设施错误码）
-- 关键端点 Schema：§6.1~§6.7（ingest / ask / ask-stream SSE / events SSE / config / health / 其余端点）
-- health 响应新契约：见《03_企业级技术栈变更总纲》§7（postgres/opensearch/rabbitmq/redis/etcd/git 六个依赖字段）
-
-本目录在后续迭代中补充 OpenAPI / 示例集合。
+| 文件 | 说明 |
+|---|---|
+| [API.md](API.md) | API v1 完整接口文档：21 个端点、统一信封、错误码全表、限流规则、SSE/WebSocket 事件格式（与代码逐一核对） |
+| [gowiki.postman_collection.json](gowiki.postman_collection.json) | Postman 集合，导入后设 `base_url` / `api_key` 两个变量即可调试 |
