@@ -47,6 +47,8 @@ func (c *Consumer) Deliveries(ctx context.Context) (<-chan amqp.Delivery, error)
 }
 
 // supervise 消费监督循环：建立消费 → 转发消息 → 断线重连。
+// 内置看门狗：队列有积压但 60s 无新消息到达（半死连接的 phantom unack 占住 prefetch 槽位）
+// → 强制标记连接半死并重建消费。
 func (c *Consumer) supervise(ctx context.Context, out chan<- amqp.Delivery) {
 	defer close(out)
 	retries := 0
@@ -74,6 +76,74 @@ func (c *Consumer) supervise(ctx context.Context, out chan<- amqp.Delivery) {
 		if !sleepOrDone(ctx, reconnectInterval) {
 			return
 		}
+	}
+}
+
+// pump 把当前 channel 的消息转发到 out；返回 true 表示应退出监督循环（ctx 取消/Stop）。
+// 带看门狗：队列有深度但超 60s 无消息 → 半死判定，ForceClose 后返回 false 触发重连。
+func (c *Consumer) pump(ctx context.Context, out chan<- amqp.Delivery, deliveries <-chan amqp.Delivery) bool {
+	lastDelivery := time.Now()
+	watchdog := time.NewTicker(30 * time.Second)
+	defer watchdog.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return true
+		case <-c.stopCh:
+			return true
+		case <-watchdog.C:
+			if time.Since(lastDelivery) < 60*time.Second {
+				continue
+			}
+			depth, err := c.queueDepth(ctx)
+			if err == nil && depth > 0 {
+				c.logger.Error("rabbitmq consumer stalled (backlog but no delivery), forcing reconnect",
+					zap.Int("queue_depth", depth))
+				c.conn.ForceClose()
+				return false
+			}
+		case d, ok := <-deliveries:
+			if !ok {
+				return false // channel 断开：触发重连
+			}
+			lastDelivery = time.Now()
+			select {
+			case out <- d:
+			case <-ctx.Done():
+				return true
+			}
+		}
+	}
+}
+
+// queueDepth 看门狗用的轻量深度探测（被动声明 + 超时兜底）。
+func (c *Consumer) queueDepth(ctx context.Context) (int, error) {
+	type res struct {
+		n   int
+		err error
+	}
+	resultCh := make(chan res, 1)
+	go func() {
+		ch, err := c.conn.Channel()
+		if err != nil {
+			resultCh <- res{0, err}
+			return
+		}
+		defer ch.Close()
+		q, err := ch.QueueDeclarePassive(QueueJobs, true, false, false, false, nil)
+		if err != nil {
+			resultCh <- res{0, err}
+			return
+		}
+		resultCh <- res{q.Messages, nil}
+	}()
+	select {
+	case r := <-resultCh:
+		return r.n, r.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-time.After(3 * time.Second):
+		return 0, fmt.Errorf("queue depth timeout")
 	}
 }
 
@@ -106,26 +176,7 @@ func (c *Consumer) startConsume() (<-chan amqp.Delivery, error) {
 	return deliveries, nil
 }
 
-// pump 把当前 channel 的消息转发到 out；返回 true 表示应退出监督循环（ctx 取消/Stop）。
-func (c *Consumer) pump(ctx context.Context, out chan<- amqp.Delivery, deliveries <-chan amqp.Delivery) bool {
-	for {
-		select {
-		case <-ctx.Done():
-			return true
-		case <-c.stopCh:
-			return true
-		case d, ok := <-deliveries:
-			if !ok {
-				return false // channel 断开：触发重连
-			}
-			select {
-			case out <- d:
-			case <-ctx.Done():
-				return true
-			}
-		}
-	}
-}
+
 
 // Stop 停拉新消息（优雅退出第一步，硬约束 #10）；在途消息由 Worker Pool 排空或 nack requeue=true。
 func (c *Consumer) Stop(ctx context.Context) error {
