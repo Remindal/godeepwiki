@@ -370,6 +370,31 @@ func (e *WikiExecutor) Execute(ctx context.Context, t *model.Task) error {
 	if err != nil {
 		return err
 	}
+
+	// 心跳：LLM 慢时单页生成可能超过 Reconciler stale 阈值（updated_at>5min），
+	// 期间周期触碰 updated_at，防止运行中的任务被误判 stale 重置重投。
+	hbDone := make(chan struct{})
+	defer close(hbDone)
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				hctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				// 空 patch：仅 updated_at = now()，不做状态迁移。
+				if err := e.tasks.UpdateState(hctx, t.TaskID, model.TaskPatch{}); err != nil {
+					e.logger.Warn("wiki heartbeat failed", zap.String("task_id", t.TaskID), zap.Error(err))
+				}
+				cancel()
+			}
+		}
+	}()
+
 	cfg := e.cfg.Get()
 	r, ok := e.retrievers[cfg.Retriever.Mode]
 	if !ok {
