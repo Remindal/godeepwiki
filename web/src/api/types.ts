@@ -86,8 +86,8 @@ export interface Health {
   llm: { provider: string; model: string; reachable: boolean; breaker: string }
   embedding: { provider: string; model: string; reachable: boolean; breaker: string; dimensions?: number }
   postgres: { connected: boolean }
-  opensearch: { connected: boolean }
-  rabbitmq: { connected: boolean; queue_depth: number }
+  opensearch: { connected: boolean; cluster_status?: string; indices?: number }
+  rabbitmq: { connected: boolean; queue_depth: number; consumers?: number }
   redis: { connected: boolean; ratelimit_degraded: boolean }
   etcd: { connected: boolean }
   git: { available: boolean }

@@ -164,7 +164,7 @@ onMounted(async () => {
 .new-chat-btn:hover { box-shadow: var(--dw-shadow); }
 .new-chat-btn span { margin-right: 4px; }
 
-.nav { display: flex; flex-direction: column; gap: 2px; }
+.nav { display: flex; flex-direction: column; gap: 6px; }
 
 .history {
   flex: 1;
@@ -172,10 +172,12 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   margin-top: 14px;
-  padding-top: 10px;
+  padding: 10px 6px 6px;
   border-top: 1px solid var(--dw-border);
+  background: rgba(0, 0, 0, 0.03); /* 灰度分区：历史区浅灰底，与导航区/页脚区分 */
+  border-radius: var(--dw-radius-md);
 }
-.history-title { font-size: 12px; padding: 0 10px 6px; }
+.history-title { font-size: 12px; padding: 0 8px 6px; }
 .history-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
 .history-item {
   padding: 7px 10px;
@@ -183,7 +185,7 @@ onMounted(async () => {
   cursor: pointer;
   transition: background 0.12s ease;
 }
-.history-item:hover { background: var(--dw-bg-mute); }
+.history-item:hover { background: rgba(0, 0, 0, 0.05); }
 .history-item.active { background: var(--dw-white); box-shadow: var(--dw-shadow); }
 .history-preview {
   font-size: 13px;
@@ -194,22 +196,26 @@ onMounted(async () => {
 }
 .history-meta { font-size: 11px; margin-top: 2px; }
 
+/* 导航/页脚四个交互键：按钮化药丸样式（白底+描边），激活态黑底白字强对比 */
 .nav-item {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 8px 12px;
   border-radius: var(--dw-radius-sm);
+  border: 1px solid var(--dw-border);
+  background: var(--dw-white);
   font-size: 13px;
-  color: var(--dw-text-2);
+  color: var(--dw-text);
   cursor: pointer;
-  transition: background 0.12s ease;
+  transition: background 0.12s ease, color 0.12s ease, box-shadow 0.15s ease;
   user-select: none;
 }
-.nav-item:hover { background: var(--dw-bg-mute); }
+.nav-item:hover { box-shadow: var(--dw-shadow); }
 .nav-item.active {
-  background: var(--dw-white);
-  color: var(--dw-text);
+  background: var(--dw-black);
+  border-color: var(--dw-black);
+  color: var(--dw-white);
   font-weight: 500;
   box-shadow: var(--dw-shadow);
 }
@@ -221,7 +227,17 @@ onMounted(async () => {
   opacity: 0.5;
 }
 
-.sidebar-footer { padding-top: 10px; border-top: 1px solid var(--dw-border); }
+/* 灰度分区：页脚深灰容器，与导航区/历史区拉开层次 */
+.sidebar-footer {
+  margin-top: 10px;
+  padding: 8px 6px;
+  border-top: 1px solid var(--dw-border);
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: var(--dw-radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 
 .main {
   flex: 1;
