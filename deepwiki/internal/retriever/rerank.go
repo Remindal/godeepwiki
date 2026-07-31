@@ -104,7 +104,7 @@ func (rr *LLMReranker) Rerank(ctx context.Context, query string, candidates []mo
 			{Role: "user", Content: sb.String()},
 		},
 		Temperature: 0,
-		MaxTokens:   256,
+		MaxTokens:   1024, // thinking 模型推理占 token 预算，256 会导致评分输出截断
 	})
 	if err != nil {
 		return nil, fmt.Errorf("llm rerank generate: %w", err)

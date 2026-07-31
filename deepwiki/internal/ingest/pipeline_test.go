@@ -61,6 +61,30 @@ func (f *fakePersister) InsertBatch(ctx context.Context, chunks []model.Chunk) e
 	return nil
 }
 
+// fakeIndexer 记录 OpenSearch 装块调用（persisting 阶段随落库装索引）。
+type fakeIndexer struct {
+	created   []string
+	bulked    []model.Chunk
+	createErr error
+}
+
+func (f *fakeIndexer) CreateIndex(ctx context.Context, repoID string) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	f.created = append(f.created, repoID)
+	return nil
+}
+
+func (f *fakeIndexer) BulkIndex(ctx context.Context, repoID string, chunks []model.Chunk) error {
+	f.bulked = append(f.bulked, chunks...)
+	return nil
+}
+
+func (f *fakeIndexer) DeleteByPaths(ctx context.Context, repoID string, paths []string) error {
+	return nil
+}
+
 type fakeBus struct {
 	events []model.Event
 }
@@ -97,11 +121,13 @@ func newTestPipelineContext(t *testing.T) *PipelineContext {
 
 func TestPipelineRunStages(t *testing.T) {
 	persister := &fakePersister{}
+	indexer := &fakeIndexer{}
 	bus := &fakeBus{}
 	stages := NewIngestStages(StageDeps{
 		Cloner:   fakeCloner{},
 		Embedder: fakeEmbedder{model: "fake-embed-v1"},
 		Chunks:   persister,
+		Indexer:  indexer,
 	})
 	p := NewPipeline(stages, bus, zap.NewNop())
 
@@ -158,6 +184,12 @@ func TestPipelineRunStages(t *testing.T) {
 	if len(persister.chunks) == 0 || len(persister.chunks) != len(pc.Chunks) {
 		t.Fatalf("persisted %d chunks, pc has %d", len(persister.chunks), len(pc.Chunks))
 	}
+	if len(indexer.created) != 1 || indexer.created[0] != "repo_test" {
+		t.Fatalf("CreateIndex calls = %v, want [repo_test]", indexer.created)
+	}
+	if len(indexer.bulked) != len(pc.Chunks) {
+		t.Fatalf("BulkIndex got %d chunks, want %d", len(indexer.bulked), len(pc.Chunks))
+	}
 	for _, c := range persister.chunks {
 		if c.ParentChunkID == "" {
 			// 父块：不向量化（完整上下文，仅 PG）。
@@ -170,6 +202,22 @@ func TestPipelineRunStages(t *testing.T) {
 		if c.StartLine < 1 || c.StartLine > c.EndLine || c.Path == "" {
 			t.Fatalf("chunk %s invalid span/path: %+v", c.ChunkID, c)
 		}
+	}
+}
+
+func TestPipelineNoIndexableFiles(t *testing.T) {
+	// include_ext 过滤掉全部文件：parsing 阶段应以 ErrNoIndexableFiles 失败，
+	// 而不是 0 文件/0 块 "成功" 完成把仓库误标 ready。
+	p := NewPipeline(NewIngestStages(StageDeps{Cloner: fakeCloner{}, Embedder: fakeEmbedder{}, Chunks: &fakePersister{}}), nil, zap.NewNop())
+	pc := newTestPipelineContext(t)
+	pc.Options.IncludeExt = []string{".xyz"}
+	err := p.Run(context.Background(), pc, nil)
+	var stageErr *StageError
+	if !errors.As(err, &stageErr) || !errors.Is(stageErr.Err, ErrNoIndexableFiles) {
+		t.Fatalf("err = %v, want StageError(ErrNoIndexableFiles)", err)
+	}
+	if stageErr.Stage != model.TaskStateParsing {
+		t.Fatalf("stage = %s, want parsing", stageErr.Stage)
 	}
 }
 

@@ -190,8 +190,8 @@ func main() {
 			logger.Warn("auto wiki generate failed", zap.String("repo_id", repoID), zap.Error(err))
 		}
 	}
-	tm.RegisterExecutor(service.NewIngestExecutor(taskStore, repoStore, cloner, emb, chunkStore, bus, cm, onAutoWiki, logger))
-	tm.RegisterExecutor(service.NewRefreshExecutor(taskStore, repoStore, cloner, emb, chunkStore, bus, cm, logger))
+	tm.RegisterExecutor(service.NewIngestExecutor(taskStore, repoStore, cloner, emb, chunkStore, searchCli, bus, cm, onAutoWiki, logger))
+	tm.RegisterExecutor(service.NewRefreshExecutor(taskStore, repoStore, cloner, emb, chunkStore, searchCli, bus, cm, logger))
 	tm.RegisterExecutor(service.NewWikiExecutor(taskStore, repoStore, wikiStore, chunkStore, retrievers, llmClient, cm, bus, logger))
 	tm.Start(ctx, consumer)
 	tm.StartDLQConsumer(ctx, mq)

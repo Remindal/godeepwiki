@@ -121,7 +121,7 @@ func (r *MultiQueryRetriever) rewriteQueries(ctx context.Context, query string) 
 		Model:       r.llm.ModelName(),
 		Messages:    []model.ChatMessage{{Role: "user", Content: prompt}},
 		Temperature: 0.3,
-		MaxTokens:   200,
+		MaxTokens:   1024, // thinking 模型推理也占 token 预算，200 会被烧光导致改写为空
 	})
 	if err != nil {
 		r.logger.Warn("multi-query rewrite failed, fallback to original", zap.Error(err))

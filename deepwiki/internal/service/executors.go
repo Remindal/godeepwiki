@@ -36,14 +36,15 @@ type IngestExecutor struct {
 	cloner     ingest.Cloner
 	embedder   ingest.Embedder
 	chunks     store.ChunkStore
+	indexer    ingest.ChunkIndexer // OpenSearch 装块（persisting 阶段随落库即装索引，新部署免重启）
 	bus        eventbus.EventBus
 	cfg        *config.Manager
 	onAutoWiki func(ctx context.Context, repoID string)
 	logger     *zap.Logger
 }
 
-func NewIngestExecutor(tasks task.TaskStore, repos store.RepoStore, cloner ingest.Cloner, embedder ingest.Embedder, chunks store.ChunkStore, bus eventbus.EventBus, cfg *config.Manager, onAutoWiki func(ctx context.Context, repoID string), logger *zap.Logger) *IngestExecutor {
-	return &IngestExecutor{tasks: tasks, repos: repos, cloner: cloner, embedder: embedder, chunks: chunks, bus: bus, cfg: cfg, onAutoWiki: onAutoWiki, logger: logger}
+func NewIngestExecutor(tasks task.TaskStore, repos store.RepoStore, cloner ingest.Cloner, embedder ingest.Embedder, chunks store.ChunkStore, indexer ingest.ChunkIndexer, bus eventbus.EventBus, cfg *config.Manager, onAutoWiki func(ctx context.Context, repoID string), logger *zap.Logger) *IngestExecutor {
+	return &IngestExecutor{tasks: tasks, repos: repos, cloner: cloner, embedder: embedder, chunks: chunks, indexer: indexer, bus: bus, cfg: cfg, onAutoWiki: onAutoWiki, logger: logger}
 }
 
 func (e *IngestExecutor) Type() model.TaskType { return model.TaskTypeIngest }
@@ -86,7 +87,7 @@ func (e *IngestExecutor) Execute(ctx context.Context, t *model.Task) error {
 		WorkDir: tmpDir,
 	}
 
-	stages := ingest.NewIngestStages(ingest.StageDeps{Cloner: e.cloner, Embedder: e.embedder, Chunks: e.chunks})
+	stages := ingest.NewIngestStages(ingest.StageDeps{Cloner: e.cloner, Embedder: e.embedder, Chunks: e.chunks, Indexer: e.indexer})
 	pipeline := ingest.NewPipeline(stages, e.bus, e.logger)
 	report := e.progressReporter(t)
 
@@ -100,7 +101,13 @@ func (e *IngestExecutor) Execute(ctx context.Context, t *model.Task) error {
 				zap.String("stage", string(stageErr.Stage)),
 				zap.Error(stageErr.Err),
 			)
-			e.failTask(ctx, t.TaskID, stageErr.Stage)
+			if errors.Is(stageErr.Err, ingest.ErrNoIndexableFiles) {
+				// 过滤后 0 文件：明确失败原因，不写成泛化的 task_interrupted。
+				e.failTaskWith(ctx, t.TaskID, stageErr.Stage, model.CodeInvalidParam,
+					"过滤后没有可索引文件，请调整 include_ext/exclude_dirs 后重试")
+			} else {
+				e.failTask(ctx, t.TaskID, stageErr.Stage)
+			}
 			e.markRepoError(ctx, repo.RepoID)
 			return nil
 		}
@@ -143,11 +150,15 @@ func (e *IngestExecutor) progressReporter(t *model.Task) ingest.ProgressReport {
 }
 
 func (e *IngestExecutor) failTask(ctx context.Context, taskID string, stage model.TaskState) {
+	e.failTaskWith(ctx, taskID, stage, model.CodeTaskInterrupted, model.MessageOf(model.CodeTaskInterrupted))
+}
+
+func (e *IngestExecutor) failTaskWith(ctx context.Context, taskID string, stage model.TaskState, code int, message string) {
 	now := time.Now().UTC()
 	failed := model.TaskStateFailed
 	_ = e.tasks.UpdateState(ctx, taskID, model.TaskPatch{
 		State:      &failed,
-		Err:        &model.TaskError{Code: model.CodeTaskInterrupted, Message: model.MessageOf(model.CodeTaskInterrupted), Stage: string(stage)},
+		Err:        &model.TaskError{Code: code, Message: message, Stage: string(stage)},
 		FinishedAt: &now,
 	})
 }
@@ -197,13 +208,14 @@ type RefreshExecutor struct {
 	cloner   ingest.Cloner
 	embedder ingest.Embedder
 	chunks   store.ChunkStore
+	indexer  ingest.ChunkIndexer
 	bus      eventbus.EventBus
 	cfg      *config.Manager
 	logger   *zap.Logger
 }
 
-func NewRefreshExecutor(tasks task.TaskStore, repos store.RepoStore, cloner ingest.Cloner, embedder ingest.Embedder, chunks store.ChunkStore, bus eventbus.EventBus, cfg *config.Manager, logger *zap.Logger) *RefreshExecutor {
-	return &RefreshExecutor{tasks: tasks, repos: repos, cloner: cloner, embedder: embedder, chunks: chunks, bus: bus, cfg: cfg, logger: logger}
+func NewRefreshExecutor(tasks task.TaskStore, repos store.RepoStore, cloner ingest.Cloner, embedder ingest.Embedder, chunks store.ChunkStore, indexer ingest.ChunkIndexer, bus eventbus.EventBus, cfg *config.Manager, logger *zap.Logger) *RefreshExecutor {
+	return &RefreshExecutor{tasks: tasks, repos: repos, cloner: cloner, embedder: embedder, chunks: chunks, indexer: indexer, bus: bus, cfg: cfg, logger: logger}
 }
 
 func (e *RefreshExecutor) Type() model.TaskType { return model.TaskTypeRefresh }
@@ -262,6 +274,10 @@ func (e *RefreshExecutor) Execute(ctx context.Context, t *model.Task) error {
 				if err := e.chunks.DeleteByPaths(ctx, repo.RepoID, dirtyPaths); err != nil {
 					return err
 				}
+				// OpenSearch 同步删旧子块文档（PG 为事实源，索引随之对账）。
+				if err := e.indexer.DeleteByPaths(ctx, repo.RepoID, dirtyPaths); err != nil {
+					return err
+				}
 			}
 			e.logger.Info("refresh diff done",
 				zap.String("repo_id", repo.RepoID),
@@ -309,7 +325,14 @@ func (e *RefreshExecutor) Execute(ctx context.Context, t *model.Task) error {
 			return nil
 		}},
 		{Name: model.TaskStatePersisting, Fn: func(ctx context.Context, pc *ingest.PipelineContext) error {
-			return e.chunks.InsertBatch(ctx, pc.Chunks)
+			// 顺序约定：Postgres 落库成功后再装 OpenSearch。
+			if err := e.chunks.InsertBatch(ctx, pc.Chunks); err != nil {
+				return err
+			}
+			if err := e.indexer.CreateIndex(ctx, repo.RepoID); err != nil { // 幂等
+				return err
+			}
+			return e.indexer.BulkIndex(ctx, repo.RepoID, pc.Chunks) // 内部只装子块
 		}},
 	}
 

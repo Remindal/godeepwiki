@@ -119,6 +119,10 @@ func (h *WikiHandler) handleWikiError(c *gin.Context, err error) {
 		respondError(c, model.CodeRepoNotFound, model.MessageOf(model.CodeRepoNotFound), nil)
 	case errors.Is(err, model.ErrWikiNotFound):
 		respondError(c, model.CodeWikiNotFound, model.MessageOf(model.CodeWikiNotFound), nil)
+	case errors.Is(err, model.ErrQueueUnavailable):
+		respondError(c, model.CodeQueueUnavailable, model.MessageOf(model.CodeQueueUnavailable), nil)
+	case errors.Is(err, model.ErrQueueFull):
+		respondError(c, model.CodeQueueFull, model.MessageOf(model.CodeQueueFull), nil)
 	default:
 		h.logger.Error("wiki operation failed", zap.Error(err))
 		respondError(c, model.CodeInternalError, model.MessageOf(model.CodeInternalError), nil)

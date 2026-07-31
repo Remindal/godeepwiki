@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -83,11 +84,23 @@ type ChunkPersister interface {
 	InsertBatch(ctx context.Context, chunks []model.Chunk) error
 }
 
+// ChunkIndexer OpenSearch 装块依赖（结构型接口，由 service 层注入 *search.Client 实现）。
+// 摄取落库成功后即建/装索引，不再依赖下次启动时的对账重建（新部署免重启即可检索）。
+type ChunkIndexer interface {
+	CreateIndex(ctx context.Context, repoID string) error
+	BulkIndex(ctx context.Context, repoID string, chunks []model.Chunk) error
+	DeleteByPaths(ctx context.Context, repoID string, paths []string) error
+}
+
+// ErrNoIndexableFiles 过滤后无可索引文件（parsing 阶段守卫，防 0 文件仓库误标 ready）。
+var ErrNoIndexableFiles = errors.New("no indexable files after filtering")
+
 // StageDeps 六阶段装配依赖。
 type StageDeps struct {
 	Cloner   Cloner
 	Embedder Embedder
 	Chunks   ChunkPersister
+	Indexer  ChunkIndexer // 可选：nil 时 persisting 只落库不装索引（测试用）
 }
 
 // NewIngestStages 装配 ingest 五阶段（pending 与 completed 由 Run 首尾处理）：
@@ -101,6 +114,9 @@ func NewIngestStages(deps StageDeps) []Stage {
 			files, err := ParseFiles(ctx, pc.WorkDir, pc.Options)
 			if err != nil {
 				return err
+			}
+			if len(files) == 0 {
+				return ErrNoIndexableFiles
 			}
 			pc.Files = files
 			return nil
@@ -141,7 +157,20 @@ func NewIngestStages(deps StageDeps) []Stage {
 			return nil
 		}},
 		{Name: model.TaskStatePersisting, Fn: func(ctx context.Context, pc *PipelineContext) error {
-			return deps.Chunks.InsertBatch(ctx, pc.Chunks)
+			// 顺序约定：Postgres 落库成功后再装 OpenSearch（PG 为唯一事实源）。
+			if err := deps.Chunks.InsertBatch(ctx, pc.Chunks); err != nil {
+				return err
+			}
+			if deps.Indexer != nil {
+				if err := deps.Indexer.CreateIndex(ctx, pc.Repo.RepoID); err != nil { // 幂等
+					return err
+				}
+				// BulkIndex 内部跳过父块，只装子块（BM25 检索入口）。
+				if err := deps.Indexer.BulkIndex(ctx, pc.Repo.RepoID, pc.Chunks); err != nil {
+					return err
+				}
+			}
+			return nil
 		}},
 	}
 }

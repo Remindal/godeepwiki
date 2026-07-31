@@ -131,6 +131,32 @@ func (c *Client) DeleteIndex(ctx context.Context, repoID string) error {
 	return nil
 }
 
+// DeleteByPaths 按路径精确删除文档（refresh 增量：modified ∪ deleted 文件的旧子块；
+// terms 匹配 keyword 子字段 path.raw；index_not_found 视为成功）。
+func (c *Client) DeleteByPaths(ctx context.Context, repoID string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	index := IndexName(c.prefix, repoID)
+	body, err := json.Marshal(map[string]any{
+		"query": map[string]any{"terms": map[string]any{"path.raw": paths}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.api.Document.DeleteByQuery(ctx, opensearchapi.DocumentDeleteByQueryReq{
+		Indices: []string{index},
+		Body:    bytes.NewReader(body),
+	})
+	if err != nil {
+		if isErrStatus(err, 404) {
+			return nil
+		}
+		return fmt.Errorf("opensearch delete_by_query %s: %w", index, err)
+	}
+	return nil
+}
+
 // chunkDoc 索引文档结构（与 chunksIndexMapping properties 对齐）。
 type chunkDoc struct {
 	ChunkID   string `json:"chunk_id"`
