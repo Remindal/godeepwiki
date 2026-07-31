@@ -49,6 +49,11 @@ func TestStore(t *testing.T) {
 	if err != nil {
 		t.Fatal("insert repo:", err)
 	}
+	// 测试数据随用随清：repo_test 不符合 API 的 ULID 校验，残留后前端无法删除。
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM chunks WHERE repo_id='repo_test'`)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM repos WHERE repo_id='repo_test'`)
+	}()
 
 	_, err = pool.Exec(ctx, `DELETE FROM chunks WHERE repo_id='repo_test'`)
 	if err != nil {
@@ -113,6 +118,9 @@ func TestStore(t *testing.T) {
 		`INSERT INTO tasks (task_id,type,repo_id,state,created_at)
 		 VALUES ('tsk_cascade','ingest','repo_cascade','completed',now())`,
 	)
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM tasks WHERE task_id='tsk_cascade'`)
+	}()
 
 	_, err = pool.Exec(ctx, `DELETE FROM repos WHERE repo_id='repo_cascade'`)
 	if err != nil {
@@ -151,6 +159,9 @@ func TestStore(t *testing.T) {
 	if err != nil {
 		t.Fatal("insert key:", err)
 	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM api_keys WHERE key_id='key_01J2X9K7QZ0ABCDEFGHJKMNP'`)
+	}()
 	var foundHash string
 	err = pool.QueryRow(ctx, `SELECT key_hash FROM api_keys WHERE key_hash=$1 AND revoked_at IS NULL`, keyHash).Scan(&foundHash)
 	if err != nil || foundHash != keyHash {
