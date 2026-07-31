@@ -27,6 +27,8 @@ type Publisher interface {
 	// QueueDepth 背压预检：QueueDeclarePassive 读主队列 Messages 深度
 	//（≥ x-max-length 时 Manager.Submit 拒绝投递 → 42902 + Retry-After，硬约束 #6）。
 	QueueDepth(ctx context.Context) (int, error)
+	// QueueStats 同一次 QueueDeclarePassive 顺带读 Consumers 数（health 快照用）。
+	QueueStats(ctx context.Context) (depth, consumers int, err error)
 	// Close 关闭 channel（不断开共享 Conn）。
 	Close() error
 }
@@ -195,26 +197,32 @@ func (p *amqpPublisher) publishTo(ctx context.Context, exchange, routingKey stri
 }
 
 func (p *amqpPublisher) QueueDepth(ctx context.Context) (int, error) {
+	depth, _, err := p.QueueStats(ctx)
+	return depth, err
+}
+
+func (p *amqpPublisher) QueueStats(ctx context.Context) (depth, consumers int, err error) {
 	// QueueDeclarePassive 是同步 AMQP RPC 且不接受 ctx；半死连接上会永久阻塞
 	// （曾导致 health/Submit 挂死）。放独立 goroutine 执行并加 3s 超时兜底。
-	type depthResult struct {
-		n   int
-		err error
+	type statsResult struct {
+		depth     int
+		consumers int
+		err       error
 	}
-	resultCh := make(chan depthResult, 1)
+	resultCh := make(chan statsResult, 1)
 	go func() {
 		ch, err := p.conn.Channel()
 		if err != nil {
-			resultCh <- depthResult{0, err}
+			resultCh <- statsResult{0, 0, err}
 			return
 		}
 		defer ch.Close()
 		q, err := ch.QueueDeclarePassive(QueueJobs, true, false, false, false, nil)
 		if err != nil {
-			resultCh <- depthResult{0, err}
+			resultCh <- statsResult{0, 0, err}
 			return
 		}
-		resultCh <- depthResult{q.Messages, nil}
+		resultCh <- statsResult{q.Messages, q.Consumers, nil}
 	}()
 
 	select {
@@ -226,15 +234,15 @@ func (p *amqpPublisher) QueueDepth(ctx context.Context) (int, error) {
 				if topoErr := p.conn.DeclareTopology(ctx); topoErr != nil {
 					p.logger.Warn("rabbitmq topology redeclare failed", zap.Error(topoErr))
 				}
-				return 0, nil
+				return 0, 0, nil
 			}
-			return 0, r.err
+			return 0, 0, r.err
 		}
-		return r.n, nil
+		return r.depth, r.consumers, nil
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, 0, ctx.Err()
 	case <-time.After(3 * time.Second):
-		return 0, fmt.Errorf("rabbitmq queue depth timeout")
+		return 0, 0, fmt.Errorf("rabbitmq queue depth timeout")
 	}
 }
 

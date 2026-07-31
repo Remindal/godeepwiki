@@ -358,10 +358,11 @@ func (p *healthProber) probeOnce(ctx context.Context) {
 		degraded = true
 	}
 
-	// RabbitMQ：主队列深度（QueueDeclarePassive）；指标 deepwiki_queue_length / rabbitmq_queue_depth。
-	depth, mqErr := p.publisher.QueueDepth(probeCtx)
+	// RabbitMQ：主队列深度与消费者数（QueueDeclarePassive）；指标 deepwiki_queue_length / rabbitmq_queue_depth。
+	depth, consumers, mqErr := p.publisher.QueueStats(probeCtx)
 	snap.RabbitMQ.Connected = mqErr == nil
 	snap.RabbitMQ.QueueDepth = depth
+	snap.RabbitMQ.Consumers = consumers
 	if mqErr == nil {
 		p.metrics.QueueLength.Set(float64(depth))
 		p.metrics.RabbitMQQueueDepth.WithLabelValues("deepwiki.task.jobs").Set(float64(depth))

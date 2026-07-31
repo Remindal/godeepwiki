@@ -238,4 +238,7 @@ func (f *fakePublisher) Publish(ctx context.Context, msg queue.TaskMessage) erro
 func (f *fakePublisher) QueueDepth(ctx context.Context) (int, error) {
 	return f.depth, nil
 }
+func (f *fakePublisher) QueueStats(ctx context.Context) (int, int, error) {
+	return f.depth, 1, nil
+}
 func (f *fakePublisher) Close() error { return nil }
